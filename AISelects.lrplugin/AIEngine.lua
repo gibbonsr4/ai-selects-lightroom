@@ -72,25 +72,42 @@ Do not explain your reasoning. Return only valid JSON.]]
 
 -- ── Calibration prompt builder ────────────────────────────────────────
 -- Takes calibration stats and returns SCORING_PROMPT prefixed with
--- collection-specific context so the AI uses the full 1-10 range.
--- cal = { min, max, mean, stddev, bestContent, worstContent, sampleCount }
+-- prescriptive scoring context so the AI spreads scores across the full range.
+-- cal = { min, max, mean, stddev, bestContent, worstContent, sampleCount,
+--         techMin, techMax, techMean, aestMin, aestMax, aestMean }
 function M.buildCalibratedPrompt(cal)
     if not cal then return M.SCORING_PROMPT end
 
+    -- Detect how compressed the range is and push harder if needed
+    local spread = cal.max - cal.min
+    local urgency
+    if spread <= 2 then
+        urgency = "Your scores are clustering too tightly. You MUST differentiate more aggressively. "
+            .. "If two photos differ in quality at all, their scores should differ by at least 2 points. "
+    elseif spread <= 4 then
+        urgency = "Spread your scores wider. Small quality differences should produce meaningful score gaps. "
+    else
+        urgency = ""
+    end
+
     local context = string.format(
-        "CALIBRATION CONTEXT: You are scoring photos from a specific collection. "
-        .. "A sample of %d photos from this collection scored between %d and %d "
-        .. "(mean: %.1f, stddev: %.1f). "
-        .. "The strongest sample was \"%s\" (scored %d/10). "
-        .. "The weakest sample was \"%s\" (scored %d/10). "
-        .. "Use the FULL 1-10 range relative to this collection. "
-        .. "A score of 5 means median quality for THIS set. "
-        .. "Scores of 1-2 and 9-10 should be uncommon but not impossible.\n\n",
+        "SCORING CALIBRATION — READ CAREFULLY.\n"
+        .. "You are scoring photos from a collection of %d images. "
+        .. "A sample was pre-scored with these results:\n"
+        .. "  Technical: %d to %d (mean %.1f)\n"
+        .. "  Aesthetic: %d to %d (mean %.1f)\n"
+        .. "  Best sample: \"%s\" | Weakest sample: \"%s\"\n\n"
+        .. "INSTRUCTIONS: Score relative to THIS collection, not to all photos ever taken.\n"
+        .. "- The weakest photos in this set should score 1-3.\n"
+        .. "- Average photos for this set should score 4-6.\n"
+        .. "- The best photos in this set should score 8-10.\n"
+        .. "- %s"
+        .. "Do NOT default to safe middle scores. A 5 is not a safe neutral — it means below average for this set.\n\n",
         cal.sampleCount,
-        cal.min, cal.max,
-        cal.mean, cal.stddev,
-        cal.bestContent, cal.max,
-        cal.worstContent, cal.min
+        cal.techMin, cal.techMax, cal.techMean,
+        cal.aestMin, cal.aestMax, cal.aestMean,
+        cal.bestContent:sub(1, 50), cal.worstContent:sub(1, 50),
+        urgency
     )
 
     return context .. M.SCORING_PROMPT
