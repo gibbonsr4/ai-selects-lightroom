@@ -29,6 +29,7 @@ local DEFAULTS = {
     renderSize         = 512,
     burstThresholdSecs = 2,
     skipScored         = false,
+    enableCalibration  = true,
     -- Story mode
     storyPreset            = "family_vacation",
     storyCustomInstructions = "",
@@ -78,6 +79,7 @@ local function getPrefs()
         renderSize         = numPref(prefs, "renderSize"),
         burstThresholdSecs = numPref(prefs, "burstThresholdSecs"),
         skipScored         = boolPref(prefs, "skipScored"),
+        enableCalibration  = boolPref(prefs, "enableCalibration"),
         storyPreset            = stringPref(prefs, "storyPreset"),
         storyCustomInstructions = stringPref(prefs, "storyCustomInstructions", true),
         enableLogging      = boolPref(prefs, "enableLogging"),

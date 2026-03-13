@@ -75,6 +75,7 @@ function Logger:init(settings)
     end
     self:log("Render size: " .. tostring(settings.renderSize) .. "px")
     self:log("Skip scored: " .. tostring(settings.skipScored))
+    self:log("Calibration: " .. tostring(settings.enableCalibration))
     self:log("═══════════════════════════════════════════════════════════")
 end
 
@@ -118,13 +119,13 @@ function Logger:finish(successCount, errorCount, skippedCount)
 end
 
 -- ── Query and score a single photo ──────────────────────────────────────
-local function scorePhoto(photo, settings, imageIndex)
+local function scorePhoto(photo, settings, imageIndex, promptOverride)
     local ts = tostring(math.floor(LrDate.currentTime() * 1000)) .. "_" .. tostring(imageIndex or 0)
 
     local img, err = Engine.prepareImage(photo, ts, settings.provider, settings.renderSize)
     if not img then return nil, nil, err end
 
-    local prompt = Engine.SCORING_PROMPT
+    local prompt = promptOverride or Engine.SCORING_PROMPT
 
     local raw
     if settings.provider == "claude" then
@@ -178,10 +179,100 @@ local function writeScores(catalog, photo, scores, phash, filename)
     return writeResult
 end
 
--- ── Core scoring logic ─────────────────────────────────────────────────
--- Exported so ScoreAndSelect.lua can call it within its own async context.
--- Returns (successCount, errorCount, skippedCount) or shows error dialog and returns nil.
-local function runScoring(context)
+-- ── Calibration helpers ───────────────────────────────────────────────
+
+-- Sample photos evenly distributed across the capture timeline.
+-- Returns an array of indices into the photos array.
+local function sampleCalibrationPhotos(photos, sampleCount)
+    if #photos <= sampleCount then
+        local indices = {}
+        for i = 1, #photos do indices[i] = i end
+        return indices
+    end
+
+    -- Build (index, captureTime) pairs and sort by capture time
+    local timed = {}
+    for i, photo in ipairs(photos) do
+        local captureTime = photo:getRawMetadata('dateTimeOriginal')
+        timed[#timed + 1] = { idx = i, time = captureTime or 0 }
+    end
+    table.sort(timed, function(a, b) return a.time < b.time end)
+
+    -- Pick evenly spaced indices from the sorted timeline
+    local indices = {}
+    local step = #timed / sampleCount
+    for s = 0, sampleCount - 1 do
+        local pos = math.floor(s * step + step / 2) + 1
+        pos = math.min(pos, #timed)
+        indices[#indices + 1] = timed[pos].idx
+    end
+
+    return indices
+end
+
+-- Compute calibration statistics from an array of score tables.
+-- Returns stats table for buildCalibratedPrompt() and calibration dialog,
+-- or nil if insufficient data.
+local function computeCalibrationStats(scoredResults)
+    if #scoredResults < 2 then return nil end
+
+    -- Use composite score (average of technical + aesthetic) for distribution
+    local composites = {}
+    for _, s in ipairs(scoredResults) do
+        composites[#composites + 1] = {
+            composite = (s.technical + s.aesthetic) / 2,
+            content = s.content or "unknown",
+        }
+    end
+
+    table.sort(composites, function(a, b) return a.composite < b.composite end)
+
+    local sum, sumSq = 0, 0
+    local minVal, maxVal = 10, 1
+    -- Per-dimension tracking
+    local techMin, techMax, techSum = 10, 1, 0
+    local aestMin, aestMax, aestSum = 10, 1, 0
+
+    for i, c in ipairs(composites) do
+        local v = c.composite
+        sum = sum + v
+        sumSq = sumSq + v * v
+        if v < minVal then minVal = v end
+        if v > maxVal then maxVal = v end
+    end
+
+    for _, s in ipairs(scoredResults) do
+        if s.technical < techMin then techMin = s.technical end
+        if s.technical > techMax then techMax = s.technical end
+        techSum = techSum + s.technical
+        if s.aesthetic < aestMin then aestMin = s.aesthetic end
+        if s.aesthetic > aestMax then aestMax = s.aesthetic end
+        aestSum = aestSum + s.aesthetic
+    end
+
+    local n = #composites
+    local mean = sum / n
+    local variance = (sumSq / n) - (mean * mean)
+    local stddev = math.sqrt(math.max(0, variance))
+
+    return {
+        -- Composite stats (used by buildCalibratedPrompt)
+        min = math.floor(minVal + 0.5),
+        max = math.floor(maxVal + 0.5),
+        mean = mean,
+        stddev = stddev,
+        bestContent = composites[n].content,
+        worstContent = composites[1].content,
+        sampleCount = n,
+        -- Per-dimension stats (used by calibration dialog)
+        techMin = techMin, techMax = techMax, techMean = techSum / n,
+        aestMin = aestMin, aestMax = aestMax, aestMean = aestSum / n,
+    }
+end
+
+-- ── Shared setup: validate photos, API keys, filter file types ────────
+-- Returns (SETTINGS, catalog, toProcess, skipped) or nil on error/cancel.
+local function validateAndPrepare()
     local SETTINGS = Prefs.getPrefs()
     local catalog      = LrApplication.activeCatalog()
     local targetPhotos = catalog:getTargetPhotos()
@@ -241,11 +332,11 @@ local function runScoring(context)
         LrTasks.execute("rm -f /tmp/ai_sel_req_* /tmp/ai_sel_resp_* /tmp/ai_sel_cfg_* 2>/dev/null")
     end)
 
-    -- Initialize logger
-    local log = setmetatable({}, { __index = Logger })
-    log:init(SETTINGS)
-    log:log("Scoring prompt: " .. Engine.SCORING_PROMPT)
+    return SETTINGS, catalog, toProcess, skipped
+end
 
+-- ── Resolve provider display info ────────────────────────────────────
+local function getProviderInfo(SETTINGS)
     local modelName
     if SETTINGS.provider == "claude" then
         modelName = SETTINGS.claudeModel
@@ -261,21 +352,219 @@ local function runScoring(context)
         gemini = "Gemini API", ollama = "Ollama",
     }
     local providerLabel = providerLabels[SETTINGS.provider] or "Ollama"
+    return providerLabel, modelName
+end
+
+-- ── Calibration pass ─────────────────────────────────────────────────
+-- Runs setup, validation, and calibration phase.
+-- Returns a result table for runScoring(), or nil on error/cancel.
+-- Result table: { calibrationStats, calibratedPrompt, calibratedSet,
+--   toProcess, skipped, log, SETTINGS, catalog, providerLabel, modelName,
+--   calSuccessCount, calSkippedScored, calErrorLog }
+local function runCalibration(context)
+    local SETTINGS, catalog, toProcess, skipped = validateAndPrepare()
+    if not SETTINGS then return nil end
+
+    local providerLabel, modelName = getProviderInfo(SETTINGS)
+
+    -- Initialize logger
+    local log = setmetatable({}, { __index = Logger })
+    log:init(SETTINGS)
+    log:log("Scoring prompt: " .. Engine.SCORING_PROMPT)
+
+    local calibratedPrompt = nil
+    local calibratedSet = {}
+    local calibrationStats = nil
+    local successCount = 0
+    local skippedScored = 0
+    local errorLog = {}
+
+    if SETTINGS.enableCalibration and #toProcess >= 10 then
+        local progress = LrProgressScope({
+            title           = "AI Selects - Calibrating (" .. providerLabel .. " - " .. modelName .. ")",
+            functionContext = context,
+        })
+
+        local sampleSize = math.max(10, math.min(50, math.floor(#toProcess * 0.05)))
+        local sampleIndices = sampleCalibrationPhotos(toProcess, sampleSize)
+
+        log:log(string.format("Calibration: sampling %d of %d photos", #sampleIndices, #toProcess))
+
+        local calScores = {}
+
+        for ci, photoIdx in ipairs(sampleIndices) do
+            if progress:isCanceled() then
+                log:log("Calibration canceled by user")
+                progress:done()
+                log:finish(successCount, #errorLog, skippedScored)
+                return nil
+            end
+
+            local photo = toProcess[photoIdx]
+            local path = photo:getRawMetadata('path')
+            local filename = LrPathUtils.leafName(path)
+
+            progress:setPortionComplete(ci - 1, #sampleIndices)
+            progress:setCaption(string.format("Calibrating [%d/%d] %s",
+                ci, #sampleIndices, filename))
+
+            -- If skipScored is on, try to use existing scores for calibration
+            local alreadyScored = false
+            if SETTINGS.skipScored then
+                local scoreDate = photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsScoreDate')
+                if scoreDate and scoreDate ~= "" then
+                    local existingTech = tonumber(
+                        photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsTechnical'))
+                    local existingAest = tonumber(
+                        photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsAesthetic'))
+                    local existingContent =
+                        photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsContent')
+                    if existingTech and existingAest then
+                        calScores[#calScores + 1] = {
+                            technical = existingTech,
+                            aesthetic = existingAest,
+                            content = existingContent or "unknown",
+                        }
+                        calibratedSet[photoIdx] = true
+                        alreadyScored = true
+                        skippedScored = skippedScored + 1
+                        log:logImage(filename, "skipped",
+                            "calibration sample - using existing scores")
+                    end
+                end
+            end
+
+            if not alreadyScored then
+                local scores, rawResponse, err = scorePhoto(photo, SETTINGS, photoIdx)
+
+                if rawResponse then
+                    log:log(string.format("  Cal raw response: %s", rawResponse:sub(1, 500)))
+                end
+
+                if scores then
+                    local phash, phashErr = Engine.computePhash(photo,
+                        tostring(math.floor(LrDate.currentTime() * 1000))
+                        .. "_cal_" .. tostring(ci))
+                    if phashErr then
+                        log:log("  Phash warning: " .. phashErr)
+                    end
+
+                    LrTasks.yield()
+                    local writeOk, writeErr = LrTasks.pcall(function()
+                        local writeResult = writeScores(
+                            catalog, photo, scores, phash, filename)
+                        if writeResult ~= "executed" then
+                            error("Catalog write not executed (result: "
+                                .. tostring(writeResult) .. ")")
+                        end
+                    end)
+                    LrTasks.yield()
+
+                    if writeOk then
+                        calScores[#calScores + 1] = scores
+                        calibratedSet[photoIdx] = true
+                        successCount = successCount + 1
+                        log:logImage(filename, "success",
+                            string.format("Cal: Tech:%d Aest:%d %s",
+                                scores.technical, scores.aesthetic, scores.content))
+                    else
+                        table.insert(errorLog,
+                            "- " .. filename .. "\n  Cal write error: "
+                            .. tostring(writeErr))
+                        log:logImage(filename, "error",
+                            "Cal write failed: " .. tostring(writeErr))
+                    end
+                else
+                    table.insert(errorLog,
+                        "- " .. filename .. "\n  Cal: " .. (err or "unknown error"))
+                    log:logImage(filename, "error", "Cal: " .. (err or "unknown"))
+                end
+            end
+
+            LrTasks.sleep(0.05)
+        end
+
+        progress:setPortionComplete(1, 1)
+        progress:done()
+
+        -- Compute stats and build calibrated prompt
+        local calStats = computeCalibrationStats(calScores)
+        if calStats then
+            calibrationStats = calStats
+            calibratedPrompt = Engine.buildCalibratedPrompt(calStats)
+            log:log(string.format(
+                "Calibration complete: min=%d max=%d mean=%.1f stddev=%.1f best='%s' worst='%s'",
+                calStats.min, calStats.max, calStats.mean, calStats.stddev,
+                calStats.bestContent, calStats.worstContent))
+            log:log("Calibrated prompt: " .. calibratedPrompt:sub(1, 500))
+        else
+            log:log("Calibration: insufficient data, using standard prompt")
+        end
+    elseif SETTINGS.enableCalibration and #toProcess < 10 then
+        log:log("Calibration: skipped (fewer than 10 photos)")
+    end
+
+    return {
+        calibrationStats  = calibrationStats,
+        calibratedPrompt  = calibratedPrompt,
+        calibratedSet     = calibratedSet,
+        toProcess         = toProcess,
+        skipped           = skipped,
+        log               = log,
+        SETTINGS          = SETTINGS,
+        catalog           = catalog,
+        providerLabel     = providerLabel,
+        modelName         = modelName,
+        calSuccessCount   = successCount,
+        calSkippedScored  = skippedScored,
+        calErrorLog       = errorLog,
+    }
+end
+
+-- ── Core scoring logic ─────────────────────────────────────────────────
+-- Exported so ScoreAndSelect.lua can call it within its own async context.
+-- When calResult is provided (from runCalibration), skips setup/validation/calibration.
+-- When calResult is nil, runs the full flow (standalone menu item).
+-- Returns (successCount, errorCount, skippedCount, summary) or nil on error/cancel.
+local function runScoring(context, calResult)
+    -- Standalone mode: run calibration pass first
+    if not calResult then
+        calResult = runCalibration(context)
+        if not calResult then return nil end
+    end
+
+    local SETTINGS        = calResult.SETTINGS
+    local catalog         = calResult.catalog
+    local toProcess       = calResult.toProcess
+    local skipped         = calResult.skipped
+    local log             = calResult.log
+    local providerLabel   = calResult.providerLabel
+    local modelName       = calResult.modelName
+    local calibratedPrompt = calResult.calibratedPrompt
+    local calibratedSet   = calResult.calibratedSet
+    local calibrationStats = calResult.calibrationStats
+    local successCount    = calResult.calSuccessCount
+    local skippedScored   = calResult.calSkippedScored
+    local errorLog        = calResult.calErrorLog
+    local startTime       = LrDate.currentTime()
+
+    -- ── Main scoring loop ──────────────────────────────────────────────
+
     local progress = LrProgressScope({
         title           = "AI Selects (" .. providerLabel .. " - " .. modelName .. ")",
         functionContext = context,
     })
-
-    local successCount  = 0
-    local skippedScored = 0
-    local errorLog      = {}
-    local startTime     = LrDate.currentTime()
 
     for i, photo in ipairs(toProcess) do
         if progress:isCanceled() then
             log:log("Run canceled by user at image " .. i)
             break
         end
+
+        -- Skip photos already scored during calibration
+        if calibratedSet[i] then
+            -- already counted in successCount during calibration
+        else
 
         local path     = photo:getRawMetadata('path')
         local filename = LrPathUtils.leafName(path)
@@ -306,9 +595,9 @@ local function runScoring(context)
 
         progress:setCaption(string.format("[%d/%d] %s%s", i, #toProcess, filename, eta))
 
-        -- Query AI model
+        -- Query AI model (use calibrated prompt if available)
         local queryStart = LrDate.currentTime()
-        local scores, rawResponse, err = scorePhoto(photo, SETTINGS, i)
+        local scores, rawResponse, err = scorePhoto(photo, SETTINGS, i, calibratedPrompt)
         local queryElapsed = LrDate.currentTime() - queryStart
 
         if rawResponse then
@@ -357,6 +646,8 @@ local function runScoring(context)
 
         end -- if not shouldSkip
 
+        end -- if not calibratedSet[i]
+
         LrTasks.sleep(0.05)
     end
 
@@ -370,6 +661,13 @@ local function runScoring(context)
     local elapsed = LrDate.currentTime() - startTime
     local lines = { string.format("%d photo(s) scored via %s (%.0fs elapsed)",
         successCount, providerLabel, elapsed) }
+    if calibrationStats then
+        lines[#lines + 1] = string.format(
+            "Calibration: %d samples, scores %d-%d (mean %.1f, stddev %.1f)",
+            calibrationStats.sampleCount,
+            calibrationStats.min, calibrationStats.max,
+            calibrationStats.mean, calibrationStats.stddev)
+    end
     if skippedScored > 0 then
         lines[#lines + 1] = string.format("%d photo(s) skipped (already scored)", skippedScored)
     end
@@ -395,7 +693,7 @@ end
 -- global flag so we skip the standalone async task (otherwise two scoring
 -- runs would start simultaneously).
 if _G._AI_SELECTS_MODULE_LOAD then
-    return { runScoring = runScoring }
+    return { runScoring = runScoring, runCalibration = runCalibration }
 end
 
 -- Standalone entry point (menu item): wrap in async task + error handler.

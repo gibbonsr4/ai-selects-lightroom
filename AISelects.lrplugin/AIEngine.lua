@@ -70,6 +70,32 @@ Return ONLY a JSON object with these fields:
 - reject: true if obviously bad (severe blur, badly exposed, accidental/unintentional shot). Do not reject images that are merely average.
 Do not explain your reasoning. Return only valid JSON.]]
 
+-- ── Calibration prompt builder ────────────────────────────────────────
+-- Takes calibration stats and returns SCORING_PROMPT prefixed with
+-- collection-specific context so the AI uses the full 1-10 range.
+-- cal = { min, max, mean, stddev, bestContent, worstContent, sampleCount }
+function M.buildCalibratedPrompt(cal)
+    if not cal then return M.SCORING_PROMPT end
+
+    local context = string.format(
+        "CALIBRATION CONTEXT: You are scoring photos from a specific collection. "
+        .. "A sample of %d photos from this collection scored between %d and %d "
+        .. "(mean: %.1f, stddev: %.1f). "
+        .. "The strongest sample was \"%s\" (scored %d/10). "
+        .. "The weakest sample was \"%s\" (scored %d/10). "
+        .. "Use the FULL 1-10 range relative to this collection. "
+        .. "A score of 5 means median quality for THIS set. "
+        .. "Scores of 1-2 and 9-10 should be uncommon but not impossible.\n\n",
+        cal.sampleCount,
+        cal.min, cal.max,
+        cal.mean, cal.stddev,
+        cal.bestContent, cal.max,
+        cal.worstContent, cal.min
+    )
+
+    return context .. M.SCORING_PROMPT
+end
+
 -- ── Base64 encoder ────────────────────────────────────────────────────────
 -- Pre-built lookup table avoids repeated string.sub() calls per character.
 local B64_CHAR = {}

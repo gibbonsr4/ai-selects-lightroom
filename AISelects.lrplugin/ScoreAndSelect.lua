@@ -51,6 +51,7 @@ local function showRunDialog(context)
     props.varietyMode            = current.varietyMode or "proportional"
     props.storyPreset           = current.storyPreset or "family_vacation"
     props.storyCustomInstructions = current.storyCustomInstructions or ""
+    props.enableCalibration       = current.enableCalibration
 
     -- Preset description (dynamic)
     local preset = getPresetById(props.storyPreset)
@@ -246,6 +247,16 @@ local function showRunDialog(context)
                     },
                 },
             },
+            f:row {
+                f:static_text {
+                    title = "",
+                    width = LrView.share("run_label_width"),
+                },
+                f:checkbox {
+                    title = "Calibrate scores to this collection (samples photos first)",
+                    value = LrView.bind("enableCalibration"),
+                },
+            },
         },
 
         -- ═══════════════════════════════════════════════════════════
@@ -327,6 +338,7 @@ local function showRunDialog(context)
     prefs.varietyMode            = props.varietyMode
     prefs.storyPreset           = props.storyPreset
     prefs.storyCustomInstructions = props.storyCustomInstructions
+    prefs.enableCalibration       = props.enableCalibration
 
     -- Return overrides for the selection pass
     return {
@@ -336,7 +348,169 @@ local function showRunDialog(context)
         varietyMode            = props.varietyMode,
         storyPreset           = props.storyPreset,
         storyCustomInstructions = props.storyCustomInstructions,
+        enableCalibration       = props.enableCalibration,
     }
+end
+
+-- ── Calibration results dialog ──────────────────────────────────────────
+-- Shows calibration stats and lets user adjust technical/aesthetic weight.
+-- Returns updated technicalPct or nil if canceled.
+local function showCalibrationDialog(context, calStats, currentTechnicalPct)
+    local f = LrView.osFactory()
+    local props = LrBinding.makePropertyTable(context)
+
+    props.technicalPct = tostring(currentTechnicalPct)
+
+    local contents = f:column {
+        spacing         = f:dialog_spacing(),
+        fill_horizontal = 1,
+        bind_to_object  = props,
+
+        f:static_text {
+            title = string.format("Sampled %d of your photos to establish a scoring baseline.",
+                calStats.sampleCount),
+        },
+
+        f:separator { fill_horizontal = 1 },
+
+        -- Per-dimension stats
+        f:row {
+            f:static_text {
+                title     = "Technical scores:",
+                width     = LrView.share("cal_label_width"),
+                alignment = "right",
+            },
+            f:static_text {
+                title = string.format("%d — %d  (mean %.1f)",
+                    calStats.techMin, calStats.techMax, calStats.techMean),
+            },
+        },
+        f:row {
+            f:static_text {
+                title     = "Aesthetic scores:",
+                width     = LrView.share("cal_label_width"),
+                alignment = "right",
+            },
+            f:static_text {
+                title = string.format("%d — %d  (mean %.1f)",
+                    calStats.aestMin, calStats.aestMax, calStats.aestMean),
+            },
+        },
+        f:row {
+            f:static_text {
+                title     = "Combined range:",
+                width     = LrView.share("cal_label_width"),
+                alignment = "right",
+            },
+            f:static_text {
+                title = string.format("%d — %d  (mean %.1f, stddev %.1f)",
+                    calStats.min, calStats.max, calStats.mean, calStats.stddev),
+            },
+        },
+
+        f:separator { fill_horizontal = 1 },
+
+        -- Best/worst samples
+        f:row {
+            f:static_text {
+                title     = "Best sample:",
+                width     = LrView.share("cal_label_width"),
+                alignment = "right",
+            },
+            f:static_text {
+                title = string.format("\"%s\" (scored %d/10)",
+                    calStats.bestContent:sub(1, 60), calStats.max),
+            },
+        },
+        f:row {
+            f:static_text {
+                title     = "Weakest sample:",
+                width     = LrView.share("cal_label_width"),
+                alignment = "right",
+            },
+            f:static_text {
+                title = string.format("\"%s\" (scored %d/10)",
+                    calStats.worstContent:sub(1, 60), calStats.min),
+            },
+        },
+
+        f:separator { fill_horizontal = 1 },
+
+        -- Adjustable weight
+        f:row {
+            f:static_text {
+                title     = "Technical emphasis:",
+                width     = LrView.share("cal_label_width"),
+                alignment = "right",
+            },
+            f:edit_field {
+                value          = LrView.bind("technicalPct"),
+                width_in_chars = 4,
+            },
+            f:static_text { title = "%" },
+            f:static_text {
+                title      = LrView.bind {
+                    key = "technicalPct",
+                    transform = function(value)
+                        local pct = tonumber(value) or 40
+                        return string.format("(%d%% technical, %d%% aesthetic)", pct, 100 - pct)
+                    end,
+                },
+                text_color = LrView.kDisabledColor,
+            },
+        },
+        f:row {
+            f:static_text {
+                title = "",
+                width = LrView.share("cal_label_width"),
+            },
+            f:static_text {
+                title      = "Adjust based on the calibration results above.\nHigher = favor sharper images. Lower = favor more visually compelling images.",
+                text_color = LrView.kDisabledColor,
+                height_in_lines = 2,
+            },
+        },
+
+        -- Validation
+        f:row {
+            f:static_text {
+                title = "",
+                width = LrView.share("cal_label_width"),
+            },
+            f:static_text {
+                title           = LrView.bind("validationMessage"),
+                text_color      = LrView.kWarningColor,
+                fill_horizontal = 1,
+            },
+        },
+    }
+
+    props.validationMessage = ""
+
+    local result = LrDialogs.presentModalDialog {
+        title      = "AI Selects - Calibration Results",
+        contents   = contents,
+        actionVerb = "Continue Scoring",
+        actionBinding = {
+            enabled = {
+                bind_to_object = props,
+                keys = { "technicalPct" },
+                operation = function(_, values)
+                    local pct = tonumber(values.technicalPct)
+                    if not pct or pct < 0 or pct > 100 then
+                        props.validationMessage = "Technical emphasis must be between 0 and 100."
+                        return false
+                    end
+                    props.validationMessage = ""
+                    return true
+                end,
+            },
+        },
+    }
+
+    if result ~= "ok" then return nil end
+
+    return math.floor(tonumber(props.technicalPct))
 end
 
 -- ── Main execution ──────────────────────────────────────────────────────
@@ -357,8 +531,24 @@ LrTasks.startAsyncTask(function()
             local overrides = showRunDialog(context)
             if not overrides then return end  -- user canceled
 
-            -- Pass 1: Score
-            local successCount, errorCount, skipCount, scoreSummary = ScoreModule.runScoring(context)
+            -- Calibration pass (if enabled)
+            local calResult = ScoreModule.runCalibration(context)
+            if not calResult then return end  -- canceled or error
+
+            if calResult.calibrationStats then
+                -- Show calibration results and let user adjust weights
+                local newPct = showCalibrationDialog(
+                    context, calResult.calibrationStats, overrides.technicalPct)
+                if not newPct then return end  -- user canceled
+                overrides.technicalPct = newPct
+                -- Save updated weight to prefs
+                local prefs = LrPrefs.prefsForPlugin()
+                prefs.technicalPct = newPct
+            end
+
+            -- Pass 1: Score (with calibration result, skips re-calibration)
+            local successCount, errorCount, skipCount, scoreSummary =
+                ScoreModule.runScoring(context, calResult)
 
             if not scoreSummary then
                 return  -- user canceled or no photos
