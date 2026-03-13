@@ -540,12 +540,8 @@ local function runScoring(context, calResult)
     local errorLog        = calResult.calErrorLog
     local startTime       = LrDate.currentTime()
 
-    -- Score distribution tracking (seed with calibration scores)
+    -- Score distribution tracking (post-calibration only; calibration scores kept separate)
     local allTechnical, allAesthetic = {}, {}
-    for _, s in ipairs(calResult.calScores or {}) do
-        allTechnical[#allTechnical + 1] = s.technical
-        allAesthetic[#allAesthetic + 1] = s.aesthetic
-    end
 
     -- ── Main scoring loop ──────────────────────────────────────────────
 
@@ -655,22 +651,42 @@ local function runScoring(context, calResult)
     progress:setPortionComplete(1, 1)
     progress:done()
 
-    -- Log score distribution
-    if #allTechnical > 0 then
-        log:log("Score distribution (" .. #allTechnical .. " scored):")
+    -- Log score distribution (before/after if calibration was used)
+    local function logBuckets(label, techArr, aestArr)
+        if #techArr == 0 then return end
         local buckets = {}
         for b = 1, 10 do buckets[b] = 0 end
-        for j = 1, #allTechnical do
-            local composite = math.floor(allTechnical[j] * 0.5 + allAesthetic[j] * 0.5 + 0.5)
-            if composite < 1 then composite = 1 end
-            if composite > 10 then composite = 10 end
-            buckets[composite] = buckets[composite] + 1
+        for j = 1, #techArr do
+            local c = math.floor(techArr[j] * 0.5 + aestArr[j] * 0.5 + 0.5)
+            if c < 1 then c = 1 end
+            if c > 10 then c = 10 end
+            buckets[c] = buckets[c] + 1
         end
+        log:log(label .. " (" .. #techArr .. " photos):")
         for b = 1, 10 do
             if buckets[b] > 0 then
-                log:log(string.format("  Score %d: %d photos", b, buckets[b]))
+                log:log(string.format("  Score %d: %d", b, buckets[b]))
             end
         end
+    end
+    local calScoresLog = calResult.calScores or {}
+    if #calScoresLog > 0 then
+        local ct, ca = {}, {}
+        for _, s in ipairs(calScoresLog) do
+            ct[#ct + 1] = s.technical; ca[#ca + 1] = s.aesthetic
+        end
+        logBuckets("Calibration distribution", ct, ca)
+    end
+    if #allTechnical > 0 then
+        -- Combined (cal + main)
+        local ft, fa = {}, {}
+        for _, s in ipairs(calScoresLog) do
+            ft[#ft + 1] = s.technical; fa[#fa + 1] = s.aesthetic
+        end
+        for j = 1, #allTechnical do
+            ft[#ft + 1] = allTechnical[j]; fa[#fa + 1] = allAesthetic[j]
+        end
+        logBuckets("Final distribution", ft, fa)
     end
 
     -- Finish log
@@ -698,7 +714,8 @@ local function runScoring(context, calResult)
             #errorLog, table.concat(errorLog, "\n"):sub(1, 1200))
     end
     -- Score distribution breakdown
-    if #allTechnical > 0 then
+    local hasScores = #allTechnical > 0 or #(calResult.calScores or {}) > 0
+    if hasScores then
         -- Compute per-dimension stats
         local function stats(arr)
             local mn, mx, sum = 10, 1, 0
@@ -709,37 +726,95 @@ local function runScoring(context, calResult)
             end
             return mn, mx, sum / #arr
         end
-        local tMin, tMax, tMean = stats(allTechnical)
-        local aMin, aMax, aMean = stats(allAesthetic)
 
-        -- Build score histogram (1-10 buckets)
-        local buckets = {}
-        for b = 1, 10 do buckets[b] = 0 end
+        -- Build histogram buckets from score arrays
+        local function makeBuckets(techArr, aestArr)
+            local b = {}
+            for k = 1, 10 do b[k] = 0 end
+            for j = 1, #techArr do
+                local c = math.floor(techArr[j] * 0.5 + aestArr[j] * 0.5 + 0.5)
+                if c < 1 then c = 1 end
+                if c > 10 then c = 10 end
+                b[c] = b[c] + 1
+            end
+            return b
+        end
+
+        -- Calibration (before) buckets
+        local calScores = calResult.calScores or {}
+        local calTech, calAest = {}, {}
+        for _, s in ipairs(calScores) do
+            calTech[#calTech + 1] = s.technical
+            calAest[#calAest + 1] = s.aesthetic
+        end
+        local calBuckets = makeBuckets(calTech, calAest)
+
+        -- Final (after) buckets — all scores combined
+        local finalTech, finalAest = {}, {}
+        for _, s in ipairs(calScores) do
+            finalTech[#finalTech + 1] = s.technical
+            finalAest[#finalAest + 1] = s.aesthetic
+        end
         for j = 1, #allTechnical do
-            local composite = math.floor(allTechnical[j] * 0.5 + allAesthetic[j] * 0.5 + 0.5)
-            if composite < 1 then composite = 1 end
-            if composite > 10 then composite = 10 end
-            buckets[composite] = buckets[composite] + 1
+            finalTech[#finalTech + 1] = allTechnical[j]
+            finalAest[#finalAest + 1] = allAesthetic[j]
         end
-        local maxBucket = 0
-        for b = 1, 10 do
-            if buckets[b] > maxBucket then maxBucket = buckets[b] end
-        end
+        local finalBuckets = makeBuckets(finalTech, finalAest)
+
+        local tMin, tMax, tMean = stats(finalTech)
+        local aMin, aMax, aMean = stats(finalAest)
 
         lines[#lines + 1] = "\n— Score Distribution —"
         lines[#lines + 1] = string.format("Technical:  %d – %d  (mean %.1f)", tMin, tMax, tMean)
         lines[#lines + 1] = string.format("Aesthetic:  %d – %d  (mean %.1f)", aMin, aMax, aMean)
 
-        -- ASCII histogram
-        local barWidth = 16
-        lines[#lines + 1] = ""
-        for b = 1, 10 do
-            local bar = ""
-            if maxBucket > 0 then
-                local len = math.floor(buckets[b] / maxBucket * barWidth + 0.5)
-                bar = string.rep("#", len)
+        if #calTech > 0 then
+            -- Side-by-side: Calibration vs Final (percentage-based for fair comparison)
+            local barW = 10
+            local calN = math.max(#calTech, 1)
+            local finalN = math.max(#finalTech, 1)
+
+            -- Find global max percentage across both columns
+            local maxPct = 0
+            for b = 1, 10 do
+                local cp = calBuckets[b] / calN
+                local fp = finalBuckets[b] / finalN
+                if cp > maxPct then maxPct = cp end
+                if fp > maxPct then maxPct = fp end
             end
-            lines[#lines + 1] = string.format(" %2d │ %-" .. barWidth .. "s %d", b, bar, buckets[b])
+            if maxPct == 0 then maxPct = 1 end
+
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = string.format(
+                "      Calibration (%d)              All Scores (%d)", calN, finalN)
+            for b = 1, 10 do
+                local calLen = math.floor(calBuckets[b] / calN / maxPct * barW + 0.5)
+                local finalLen = math.floor(finalBuckets[b] / finalN / maxPct * barW + 0.5)
+
+                local calBar = string.rep("#", calLen)
+                local finalBar = string.rep("#", finalLen)
+
+                lines[#lines + 1] = string.format(
+                    " %2d │ %-" .. barW .. "s %3d   │ %-" .. barW .. "s %3d",
+                    b, calBar, calBuckets[b], finalBar, finalBuckets[b])
+            end
+        else
+            -- No calibration — single histogram
+            local barW = 16
+            local maxB = 0
+            for b = 1, 10 do
+                if finalBuckets[b] > maxB then maxB = finalBuckets[b] end
+            end
+            lines[#lines + 1] = ""
+            for b = 1, 10 do
+                local bar = ""
+                if maxB > 0 then
+                    local len = math.floor(finalBuckets[b] / maxB * barW + 0.5)
+                    bar = string.rep("#", len)
+                end
+                lines[#lines + 1] = string.format(
+                    " %2d │ %-" .. barW .. "s %d", b, bar, finalBuckets[b])
+            end
         end
     end
 
