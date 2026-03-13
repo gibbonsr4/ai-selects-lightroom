@@ -59,15 +59,15 @@ M.MODELS_JSON_URL =
     "https://raw.githubusercontent.com/gibbonsr4/ai-editor-lightroom/main/models.json"
 
 -- ── Scoring prompt ──────────────────────────────────────────────────────
-M.SCORING_PROMPT = [[Rate this photo for a curated photo book selection.
+M.SCORING_PROMPT = [[Rate this photo for a curated photo selection.
 Return ONLY a JSON object with these fields:
-- technical (1-10): sharpness, exposure, noise, white balance
-- aesthetic (1-10): composition, lighting, mood, visual impact
+- technical (1-10): sharpness, exposure, noise, white balance. Scale: 1-2 = technically broken (severe blur, black frame, accidental shot), 3-4 = poor (noticeable problems but identifiable subject), 5-6 = acceptable (average snapshot, nothing remarkable), 7-8 = good (solid technique, well exposed, intentional), 9-10 = exceptional (tack sharp, perfect exposure, professional quality).
+- aesthetic (1-10): composition, lighting, mood, visual impact. Scale: 1-2 = no compositional intent, 3-4 = basic snapshot framing, 5-6 = competent but unremarkable, 7-8 = strong composition with good light and mood, 9-10 = striking image with excellent visual impact.
 - content: 3-5 word description of the main subject/scene
-- dominated_by: primary visual element (e.g. 'landscape', 'portrait', 'wildlife', 'architecture', 'food', 'street')
+- dominated_by: primary visual category (one of: 'landscape', 'portrait', 'wildlife', 'architecture', 'food', 'street', 'macro', 'event', 'nature', 'other')
 - narrative_role: best editorial role for this image (one of: 'scene_setter', 'character_moment', 'action', 'detail', 'transition', 'closing', 'establishing', 'emotional_peak')
-- eye_quality: eye quality for any visible people (one of: 'good' = open/sharp/engaged, 'fair' = open but soft/looking away, 'closed' = eyes closed or squinting, 'na' = no people visible)
-- reject: true if obviously bad (blurry, badly exposed, accidental shot)
+- eye_quality: for the most prominent person visible (one of: 'good' = open/sharp/engaged, 'fair' = open but soft or looking away, 'closed' = eyes closed or squinting, 'na' = no people or faces visible). For action/movement shots, reward the peak moment (full extension, contact, height of jump) over wind-up or follow-through.
+- reject: true if obviously bad (severe blur, badly exposed, accidental/unintentional shot). Do not reject images that are merely average.
 Do not explain your reasoning. Return only valid JSON.]]
 
 -- ── Base64 encoder ────────────────────────────────────────────────────────
@@ -351,12 +351,30 @@ function M.normalizeScores(data)
     local validEye = { good = true, fair = true, closed = true, na = true }
     if not validEye[eyeVal] then eyeVal = "na" end
 
+    -- Validate dominated_by against closed category list
+    local catVal = tostring(data.dominated_by or "other"):lower()
+    local validCat = {
+        landscape = true, portrait = true, wildlife = true,
+        architecture = true, food = true, street = true,
+        macro = true, event = true, nature = true, other = true,
+    }
+    if not validCat[catVal] then catVal = "other" end
+
+    -- Validate narrative_role against allowed values
+    local roleVal = tostring(data.narrative_role or "detail"):lower()
+    local validRole = {
+        scene_setter = true, character_moment = true, action = true,
+        detail = true, transition = true, closing = true,
+        establishing = true, emotional_peak = true,
+    }
+    if not validRole[roleVal] then roleVal = "detail" end
+
     return {
         technical      = math.max(1, math.min(10, tonumber(data.technical) or 5)),
         aesthetic      = math.max(1, math.min(10, tonumber(data.aesthetic) or 5)),
         content        = tostring(data.content or "unknown"),
-        dominated_by   = tostring(data.dominated_by or "other"),
-        narrative_role = tostring(data.narrative_role or "detail"),
+        dominated_by   = catVal,
+        narrative_role = roleVal,
         eye_quality    = eyeVal,
         reject         = (data.reject == true or data.reject == "true"),
     }

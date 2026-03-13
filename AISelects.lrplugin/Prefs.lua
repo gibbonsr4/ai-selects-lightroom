@@ -20,8 +20,7 @@ local DEFAULTS = {
     -- Selection
     selectionMode      = "bestof",
     targetCount        = 40,
-    qualityWeight      = 0.4,
-    aestheticWeight    = 0.6,
+    technicalPct       = 40,   -- percentage (0-100); aesthetic = 100 - technicalPct
     varietyMode         = "proportional",
     renderSize         = 512,
     burstThresholdSecs = 2,
@@ -66,8 +65,7 @@ local function getPrefs()
         timeoutSecs        = numPref(prefs, "timeoutSecs"),
         selectionMode      = stringPref(prefs, "selectionMode"),
         targetCount        = numPref(prefs, "targetCount"),
-        qualityWeight      = numPref(prefs, "qualityWeight"),
-        aestheticWeight    = numPref(prefs, "aestheticWeight"),
+        technicalPct       = numPref(prefs, "technicalPct"),
         varietyMode         = stringPref(prefs, "varietyMode"),
         renderSize         = numPref(prefs, "renderSize"),
         burstThresholdSecs = numPref(prefs, "burstThresholdSecs"),

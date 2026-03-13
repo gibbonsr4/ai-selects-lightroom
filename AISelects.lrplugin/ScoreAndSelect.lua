@@ -47,8 +47,7 @@ local function showRunDialog(context)
     -- Pre-fill from saved prefs
     props.selectionMode         = current.selectionMode or "bestof"
     props.targetCount           = tostring(current.targetCount)
-    props.qualityWeight         = tostring(current.qualityWeight)
-    props.aestheticWeight       = tostring(current.aestheticWeight)
+    props.technicalPct          = tostring(current.technicalPct)
     props.varietyMode            = current.varietyMode or "proportional"
     props.storyPreset           = current.storyPreset or "family_vacation"
     props.storyCustomInstructions = current.storyCustomInstructions or ""
@@ -194,21 +193,24 @@ local function showRunDialog(context)
             },
             f:row {
                 f:static_text {
-                    title     = "Quality weight:",
+                    title     = "Technical emphasis:",
                     width     = LrView.share("run_label_width"),
                     alignment = "right",
                 },
                 f:edit_field {
-                    value          = LrView.bind("qualityWeight"),
-                    width_in_chars = 5,
+                    value          = LrView.bind("technicalPct"),
+                    width_in_chars = 4,
                 },
+                f:static_text { title = "%" },
                 f:static_text {
-                    title     = "Aesthetic weight:",
-                    alignment = "right",
-                },
-                f:edit_field {
-                    value          = LrView.bind("aestheticWeight"),
-                    width_in_chars = 5,
+                    title      = LrView.bind {
+                        key = "technicalPct",
+                        transform = function(value)
+                            local pct = tonumber(value) or 40
+                            return string.format("(%d%% technical, %d%% aesthetic)", pct, 100 - pct)
+                        end,
+                    },
+                    text_color = LrView.kDisabledColor,
                 },
             },
             f:row {
@@ -217,7 +219,7 @@ local function showRunDialog(context)
                     width = LrView.share("run_label_width"),
                 },
                 f:static_text {
-                    title      = "Relative weights for composite score. Default: 0.4 quality, 0.6 aesthetic.",
+                    title      = "How much to weight technical quality vs. aesthetic appeal. Default: 40%.",
                     text_color = LrView.kDisabledColor,
                 },
             },
@@ -280,13 +282,9 @@ local function showRunDialog(context)
         if not target or target < 1 then
             return false, "Target count must be a positive number."
         end
-        local qw = tonumber(values.qualityWeight)
-        if not qw or qw < 0 then
-            return false, "Quality weight must be a positive number."
-        end
-        local aw = tonumber(values.aestheticWeight)
-        if not aw or aw < 0 then
-            return false, "Aesthetic weight must be a positive number."
+        local pct = tonumber(values.technicalPct)
+        if not pct or pct < 0 or pct > 100 then
+            return false, "Technical emphasis must be between 0 and 100."
         end
         if photoCount == 0 then
             return false, "No photos selected. Select photos in the Library grid first."
@@ -305,7 +303,7 @@ local function showRunDialog(context)
         actionBinding = {
             enabled = {
                 bind_to_object = props,
-                keys = { "targetCount", "qualityWeight", "aestheticWeight" },
+                keys = { "targetCount", "technicalPct" },
                 operation = function(_, values)
                     local isValid, validMsg = validateRunSettings(values)
                     props.validationMessage = validMsg
@@ -321,8 +319,7 @@ local function showRunDialog(context)
     local prefs = LrPrefs.prefsForPlugin()
     prefs.selectionMode         = props.selectionMode
     prefs.targetCount           = math.floor(tonumber(props.targetCount))
-    prefs.qualityWeight         = tonumber(props.qualityWeight)
-    prefs.aestheticWeight       = tonumber(props.aestheticWeight)
+    prefs.technicalPct          = math.floor(tonumber(props.technicalPct))
     prefs.varietyMode            = props.varietyMode
     prefs.storyPreset           = props.storyPreset
     prefs.storyCustomInstructions = props.storyCustomInstructions
@@ -331,8 +328,7 @@ local function showRunDialog(context)
     return {
         selectionMode         = props.selectionMode,
         targetCount           = math.floor(tonumber(props.targetCount)),
-        qualityWeight         = tonumber(props.qualityWeight),
-        aestheticWeight       = tonumber(props.aestheticWeight),
+        technicalPct          = math.floor(tonumber(props.technicalPct)),
         varietyMode            = props.varietyMode,
         storyPreset           = props.storyPreset,
         storyCustomInstructions = props.storyCustomInstructions,

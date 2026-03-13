@@ -62,7 +62,7 @@ The primary entry point. Shows a configuration dialog before each run:
 - **Story preset** — genre-specific curation guidelines (visible in Story mode)
 - **Additional instructions** — free-text field appended to any preset
 - **Target count** — how many photos to select
-- **Quality / Aesthetic weights** — balance technical vs. aesthetic scoring
+- **Technical emphasis** — percentage balance between technical quality and aesthetic appeal (default 40%)
 - **Provider info** — shows current AI provider (change in Settings)
 
 ### Selection Modes
@@ -112,15 +112,15 @@ Scores are stored in Lightroom's custom metadata — visible in the Metadata pan
 
 ### Composite Score
 
-Photos are ranked by a weighted composite score with eye quality adjustments:
+Photos are ranked by a weighted composite score:
 
 ```
-compositeScore = technical * qualityWeight + aesthetic * aestheticWeight + eyeAdjustment
+compositeScore = technical * (technicalPct / 100) + aesthetic * (1 - technicalPct / 100) + eyePenalty
 ```
 
-Eye adjustments: good eyes +0.5, fair eyes +0, closed eyes -1.5.
+Closed or squinting eyes receive a -1.5 penalty; all other eye states have no adjustment.
 
-With default weights (0.4 / 0.6), a technically perfect but boring photo scores lower than a slightly imperfect but visually stunning one.
+The default technical emphasis is 40% (aesthetic 60%), meaning a slightly imperfect but visually striking photo scores higher than a tack-sharp but boring one. Adjust in the run dialog.
 
 ## How It Works
 

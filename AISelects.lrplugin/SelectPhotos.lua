@@ -79,17 +79,20 @@ local function deduplicateByTimestamp(entries, burstThresholdSecs)
         return a.timestamp < b.timestamp
     end)
 
-    -- Walk sorted list, group adjacent photos within threshold
+    -- Walk sorted list, group adjacent photos within threshold.
+    -- Compare to the group anchor (first photo of the burst), not the previous photo.
+    -- This prevents the "chain effect" where a slow continuous stream of photos
+    -- 1.5s apart (within a 2s threshold) all chain into one mega-burst.
     local result = {}
-    local groupBest = entries[1]
+    local groupBest  = entries[1]
+    local groupStart = entries[1]  -- anchor: first photo of the current burst
 
     for i = 2, #entries do
         local curr = entries[i]
-        local prev = entries[i - 1]
 
         local inBurst = false
-        if curr.timestamp and prev.timestamp then
-            local diff = math.abs(curr.timestamp - prev.timestamp)
+        if curr.timestamp and groupStart.timestamp then
+            local diff = math.abs(curr.timestamp - groupStart.timestamp)
             if diff <= burstThresholdSecs then
                 inBurst = true
             end
@@ -101,7 +104,8 @@ local function deduplicateByTimestamp(entries, burstThresholdSecs)
             end
         else
             table.insert(result, groupBest)
-            groupBest = curr
+            groupBest  = curr
+            groupStart = curr  -- new burst starts here
         end
     end
     table.insert(result, groupBest)
@@ -482,12 +486,16 @@ local function selectStory(pool, settings, catalog)
     -- Build metadata summary
     local metadataItems = buildMetadataSummary(pool, faceMap)
 
-    -- Context window check: if metadata is too large, pre-filter to top candidates
+    -- Context window check: pre-filter if metadata exceeds model's context limit.
+    -- Claude models handle ~150K tokens safely; local Ollama models vary widely
+    -- so we use a conservative 6K token limit to avoid silent truncation.
     local summaryJson = json.encode(metadataItems)
     local estimatedTokens = #summaryJson / 4
+    local tokenLimit = (settings.provider == "claude") and 150000 or 6000
 
-    if estimatedTokens > 50000 then
-        -- Pre-filter: sort by composite score, take top 3x target
+    if estimatedTokens > tokenLimit then
+        -- Pre-filter: sort by composite score, take top candidates that fit
+        -- Start with 3x target and shrink until we fit
         local candidateCount = math.min(#pool, targetCount * 3)
         local sortedPool = {}
         for _, e in ipairs(pool) do table.insert(sortedPool, e) end
@@ -495,13 +503,26 @@ local function selectStory(pool, settings, catalog)
             return a.compositeScore > b.compositeScore
         end)
 
-        local filteredPool = {}
-        for i = 1, candidateCount do
-            table.insert(filteredPool, sortedPool[i])
+        -- Shrink candidate pool until it fits the context window
+        while candidateCount > targetCount do
+            local filteredPool = {}
+            for i = 1, candidateCount do
+                table.insert(filteredPool, sortedPool[i])
+            end
+            metadataItems = buildMetadataSummary(filteredPool, faceMap)
+            summaryJson = json.encode(metadataItems)
+            estimatedTokens = #summaryJson / 4
+            if estimatedTokens <= tokenLimit then break end
+            candidateCount = math.floor(candidateCount * 0.7)  -- shrink by 30%
         end
 
-        metadataItems = buildMetadataSummary(filteredPool, faceMap)
-        summaryJson = json.encode(metadataItems)
+        -- If we still can't fit even targetCount photos, error out
+        if estimatedTokens > tokenLimit and candidateCount <= targetCount then
+            return nil, string.format(
+                "Too many photos for this model's context window (%d photos, ~%dK tokens). " ..
+                "Reduce the number of source photos or switch to a cloud provider like Claude.",
+                #pool, math.floor(estimatedTokens / 1000))
+        end
     end
 
     -- Build the prompt
@@ -735,11 +756,15 @@ local function runSelection(context, overrides)
     end
 
     -- Compute composite scores (single pass, used by all downstream steps)
-    -- Eye quality adjustments: closed eyes penalized, good eyes rewarded
-    local EYE_ADJUST = { good = 0.5, fair = 0, closed = -1.5, na = 0 }
+    -- Convert percentage to normalized weights (40% → 0.4 technical, 0.6 aesthetic)
+    local techPct = SETTINGS.technicalPct or 40
+    local qualityWeight   = techPct / 100
+    local aestheticWeight = 1 - qualityWeight
+    -- Eye quality: binary penalty — closed/squinting eyes are penalized, everything else neutral
+    local EYE_PENALTY = -1.5
     for _, e in ipairs(scored) do
-        local base = e.technical * SETTINGS.qualityWeight + e.aesthetic * SETTINGS.aestheticWeight
-        local eyeAdj = EYE_ADJUST[e.eyeQuality] or 0
+        local base = e.technical * qualityWeight + e.aesthetic * aestheticWeight
+        local eyeAdj = (e.eyeQuality == "closed") and EYE_PENALTY or 0
         e.compositeScore = base + eyeAdj
     end
 
@@ -802,6 +827,58 @@ local function runSelection(context, overrides)
     progress:setPortionComplete(7, 10)
 
     local faceAddedCount, allPeopleNames = ensureFaceCoverage(selected, afterDedup, catalog)
+
+    -- ── Target count overflow check ─────────────────────────────────────
+    -- Allow up to 10% over target. Beyond that, trim lowest-scoring photos
+    -- that were NOT added for face coverage or gap filling.
+    local targetCount = SETTINGS.targetCount or 40
+    local maxAllowed = math.ceil(targetCount * 1.1)
+    local trimmedCount = 0
+
+    if #selected > maxAllowed then
+        -- Mark photos added for coverage so we don't trim them
+        local protectedSet = {}
+        -- Gap fills and face coverage additions are at the end of the list
+        -- (appended after the initial selection). Protect them.
+        for i = targetCount + 1, #selected do
+            if selected[i] then
+                protectedSet[selected[i]] = true
+            end
+        end
+
+        -- Sort unprotected photos by composite score (ascending = worst first)
+        local trimmable = {}
+        local protected = {}
+        for _, e in ipairs(selected) do
+            if protectedSet[e] then
+                table.insert(protected, e)
+            else
+                table.insert(trimmable, e)
+            end
+        end
+        table.sort(trimmable, function(a, b)
+            return a.compositeScore < b.compositeScore
+        end)
+
+        -- Trim from the weakest unprotected photos
+        local keepCount = maxAllowed - #protected
+        if keepCount < 0 then keepCount = 0 end
+        local trimmed = {}
+        for i = 1, math.min(keepCount, #trimmable) do
+            table.insert(trimmed, trimmable[#trimmable - i + 1])  -- best first
+        end
+        trimmedCount = #selected - #trimmed - #protected
+
+        -- Rebuild selected: kept trimmable + protected, preserving original order
+        local keptSet = {}
+        for _, e in ipairs(trimmed) do keptSet[e] = true end
+        for _, e in ipairs(protected) do keptSet[e] = true end
+        local newSelected = {}
+        for _, e in ipairs(selected) do
+            if keptSet[e] then table.insert(newSelected, e) end
+        end
+        selected = newSelected
+    end
 
     -- ── Write sequence metadata (story mode only) ─────────────────────────
     progress:setPortionComplete(8, 10)
@@ -911,6 +988,15 @@ local function runSelection(context, overrides)
     end
     if faceAddedCount > 0 then
         lines[#lines + 1] = string.format("%d photo(s) added to ensure face coverage", faceAddedCount)
+    end
+    if #selected > targetCount then
+        lines[#lines + 1] = string.format(
+            "Note: %d photos selected (target was %d — %d extra for coverage)",
+            #selected, targetCount, #selected - targetCount)
+    end
+    if trimmedCount > 0 then
+        lines[#lines + 1] = string.format(
+            "%d lower-scoring photo(s) trimmed to stay near target count", trimmedCount)
     end
     if #allPeopleNames > 0 then
         lines[#lines + 1] = string.format("People detected: %s", table.concat(allPeopleNames, ", "))

@@ -34,7 +34,7 @@ Avoid:
 - Overloading on landscape-only shots without people
 - Clustering all the best shots at the beginning]],
         requiredRoles      = { "scene_setter", "character_moment", "detail", "closing" },
-        requiredCategories = {},
+
         peopleEmphasis     = "high",
         chronological      = true,
     },
@@ -58,7 +58,7 @@ Avoid:
 - People-heavy shots unless they add scale or narrative
 - Technically weak images even if the scene is dramatic]],
         requiredRoles      = { "scene_setter", "detail", "establishing" },
-        requiredCategories = { "landscape" },
+
         peopleEmphasis     = "low",
         chronological      = false,
     },
@@ -84,7 +84,7 @@ Avoid:
 - Ignoring the people and culture in favor of scenery only
 - Repetitive compositions of similar subjects]],
         requiredRoles      = { "scene_setter", "character_moment", "action", "detail", "establishing", "closing" },
-        requiredCategories = {},
+
         peopleEmphasis     = "medium",
         chronological      = true,
     },
@@ -110,7 +110,7 @@ Avoid:
 - Dark, moody lighting unless the moment is genuinely fun
 - Overly similar shots of the same activity]],
         requiredRoles      = { "character_moment", "action", "emotional_peak" },
-        requiredCategories = {},
+
         peopleEmphasis     = "high",
         chronological      = false,
     },
@@ -137,7 +137,7 @@ Avoid:
 - Missing any major wedding milestone (ceremony, reception, first dance)
 - Back-to-back shots of the same moment from similar angles]],
         requiredRoles      = { "scene_setter", "character_moment", "action", "detail", "emotional_peak", "closing" },
-        requiredCategories = {},
+
         peopleEmphasis     = "high",
         chronological      = true,
     },
@@ -164,7 +164,7 @@ Avoid:
 - Shots where the background distracts from the subject
 - Overloading on one focal length or composition style]],
         requiredRoles      = { "character_moment", "detail", "emotional_peak" },
-        requiredCategories = { "portrait" },
+
         peopleEmphasis     = "high",
         chronological      = false,
     },
@@ -192,7 +192,7 @@ Avoid:
 - Technically perfect but visually boring images
 - Clustering similar compositions together]],
         requiredRoles      = { "scene_setter", "character_moment", "detail", "establishing", "closing" },
-        requiredCategories = {},
+
         peopleEmphasis     = "medium",
         chronological      = false,
     },
@@ -207,7 +207,7 @@ Balance technical quality with narrative coherence.
 Ensure variety in composition, subject, and visual rhythm.
 Distribute selections across the full timeline when timestamps are available.]],
         requiredRoles      = {},
-        requiredCategories = {},
+
         peopleEmphasis     = "medium",
         chronological      = true,
     },
