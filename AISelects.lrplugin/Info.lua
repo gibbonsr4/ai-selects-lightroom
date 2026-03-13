@@ -4,7 +4,7 @@ return {
 
     LrToolkitIdentifier = 'com.sonoranstrategy.ai-selects',
     LrPluginName        = 'AI Selects',
-    LrPluginInfoUrl     = 'https://github.com/gibbonsr4/ai-editor-lightroom',
+    LrPluginInfoUrl     = 'https://github.com/gibbonsr4/ai-selects-lightroom',
 
     LrMetadataProvider       = 'MetadataDefinition.lua',
     LrMetadataTagsetFactory  = 'MetadataTagset.lua',

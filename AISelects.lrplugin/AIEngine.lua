@@ -56,7 +56,7 @@ M.VISION_MODELS = {
 
 -- ── Remote model list URL ───────────────────────────────────────────────
 M.MODELS_JSON_URL =
-    "https://raw.githubusercontent.com/gibbonsr4/ai-editor-lightroom/main/models.json"
+    "https://raw.githubusercontent.com/gibbonsr4/ai-selects-lightroom/main/models.json"
 
 -- ── Scoring prompt ──────────────────────────────────────────────────────
 M.SCORING_PROMPT = [[Rate this photo for a curated photo selection.
