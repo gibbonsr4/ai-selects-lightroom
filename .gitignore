@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+._*
+
+# Lightroom
+*.lrdata
+
+# Logs
+*.log
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

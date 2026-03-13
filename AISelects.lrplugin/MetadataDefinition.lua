@@ -1,0 +1,83 @@
+return {
+    schemaVersion = 4,
+
+    metadataFieldsForPhotos = {
+        {
+            id         = 'aiSelectsTechnical',
+            dataType   = 'string',
+            title      = 'AI Selects: Technical Score',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsAesthetic',
+            dataType   = 'string',
+            title      = 'AI Selects: Aesthetic Score',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsContent',
+            dataType   = 'string',
+            title      = 'AI Selects: Content',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsCategory',
+            dataType   = 'string',
+            title      = 'AI Selects: Category',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsReject',
+            dataType   = 'string',
+            title      = 'AI Selects: Reject',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsPhash',
+            dataType   = 'string',
+            title      = 'AI Selects: Perceptual Hash',
+            searchable = false,
+            browsable  = false,
+        },
+        {
+            id         = 'aiSelectsScoreDate',
+            dataType   = 'string',
+            title      = 'AI Selects: Score Date',
+            searchable = false,
+            browsable  = false,
+        },
+        {
+            id         = 'aiSelectsNarrativeRole',
+            dataType   = 'string',
+            title      = 'AI Selects: Narrative Role',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsSequence',
+            dataType   = 'string',
+            title      = 'AI Selects: Sequence',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsStoryNote',
+            dataType   = 'string',
+            title      = 'AI Selects: Story Note',
+            searchable = true,
+            browsable  = true,
+        },
+        {
+            id         = 'aiSelectsEyeQuality',
+            dataType   = 'string',
+            title      = 'AI Selects: Eye Quality',
+            searchable = true,
+            browsable  = true,
+        },
+    },
+}
