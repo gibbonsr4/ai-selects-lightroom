@@ -367,6 +367,7 @@ local function runCalibration(context)
     local calibratedPrompt = nil
     local calibratedSet = {}
     local calibrationStats = nil
+    local calScores = {}
     local successCount = 0
     local skippedScored = 0
     local errorLog = {}
@@ -381,8 +382,6 @@ local function runCalibration(context)
         local sampleIndices = sampleCalibrationPhotos(toProcess, sampleSize)
 
         log:log(string.format("Calibration: sampling %d of %d photos", #sampleIndices, #toProcess))
-
-        local calScores = {}
 
         for ci, photoIdx in ipairs(sampleIndices) do
             if progress:isCanceled() then
@@ -500,6 +499,7 @@ local function runCalibration(context)
         calibrationStats  = calibrationStats,
         calibratedPrompt  = calibratedPrompt,
         calibratedSet     = calibratedSet,
+        calScores         = calScores,
         toProcess         = toProcess,
         skipped           = skipped,
         log               = log,
@@ -539,6 +539,13 @@ local function runScoring(context, calResult)
     local skippedScored   = calResult.calSkippedScored
     local errorLog        = calResult.calErrorLog
     local startTime       = LrDate.currentTime()
+
+    -- Score distribution tracking (seed with calibration scores)
+    local allTechnical, allAesthetic = {}, {}
+    for _, s in ipairs(calResult.calScores or {}) do
+        allTechnical[#allTechnical + 1] = s.technical
+        allAesthetic[#allAesthetic + 1] = s.aesthetic
+    end
 
     -- ── Main scoring loop ──────────────────────────────────────────────
 
@@ -617,6 +624,8 @@ local function runScoring(context, calResult)
 
             if writeOk then
                 successCount = successCount + 1
+                allTechnical[#allTechnical + 1] = scores.technical
+                allAesthetic[#allAesthetic + 1] = scores.aesthetic
                 local hashStr = phash and (" Hash:" .. phash) or ""
                 local eyeStr = (scores.eye_quality and scores.eye_quality ~= "na")
                     and (" Eye:" .. scores.eye_quality) or ""
@@ -646,6 +655,24 @@ local function runScoring(context, calResult)
     progress:setPortionComplete(1, 1)
     progress:done()
 
+    -- Log score distribution
+    if #allTechnical > 0 then
+        log:log("Score distribution (" .. #allTechnical .. " scored):")
+        local buckets = {}
+        for b = 1, 10 do buckets[b] = 0 end
+        for j = 1, #allTechnical do
+            local composite = math.floor(allTechnical[j] * 0.5 + allAesthetic[j] * 0.5 + 0.5)
+            if composite < 1 then composite = 1 end
+            if composite > 10 then composite = 10 end
+            buckets[composite] = buckets[composite] + 1
+        end
+        for b = 1, 10 do
+            if buckets[b] > 0 then
+                log:log(string.format("  Score %d: %d photos", b, buckets[b]))
+            end
+        end
+    end
+
     -- Finish log
     log:finish(successCount, #errorLog, skippedScored)
 
@@ -670,6 +697,52 @@ local function runScoring(context, calResult)
         lines[#lines + 1] = string.format("%d error(s):\n%s",
             #errorLog, table.concat(errorLog, "\n"):sub(1, 1200))
     end
+    -- Score distribution breakdown
+    if #allTechnical > 0 then
+        -- Compute per-dimension stats
+        local function stats(arr)
+            local mn, mx, sum = 10, 1, 0
+            for _, v in ipairs(arr) do
+                if v < mn then mn = v end
+                if v > mx then mx = v end
+                sum = sum + v
+            end
+            return mn, mx, sum / #arr
+        end
+        local tMin, tMax, tMean = stats(allTechnical)
+        local aMin, aMax, aMean = stats(allAesthetic)
+
+        -- Build score histogram (1-10 buckets)
+        local buckets = {}
+        for b = 1, 10 do buckets[b] = 0 end
+        for j = 1, #allTechnical do
+            local composite = math.floor(allTechnical[j] * 0.5 + allAesthetic[j] * 0.5 + 0.5)
+            if composite < 1 then composite = 1 end
+            if composite > 10 then composite = 10 end
+            buckets[composite] = buckets[composite] + 1
+        end
+        local maxBucket = 0
+        for b = 1, 10 do
+            if buckets[b] > maxBucket then maxBucket = buckets[b] end
+        end
+
+        lines[#lines + 1] = "\n— Score Distribution —"
+        lines[#lines + 1] = string.format("Technical:  %d – %d  (mean %.1f)", tMin, tMax, tMean)
+        lines[#lines + 1] = string.format("Aesthetic:  %d – %d  (mean %.1f)", aMin, aMax, aMean)
+
+        -- ASCII histogram
+        local barWidth = 16
+        lines[#lines + 1] = ""
+        for b = 1, 10 do
+            local bar = ""
+            if maxBucket > 0 then
+                local len = math.floor(buckets[b] / maxBucket * barWidth + 0.5)
+                bar = string.rep("#", len)
+            end
+            lines[#lines + 1] = string.format(" %2d │ %-" .. barWidth .. "s %d", b, bar, buckets[b])
+        end
+    end
+
     if log.enabled and log.filePath then
         lines[#lines + 1] = "\nLog saved to: " .. log.filePath
     end
