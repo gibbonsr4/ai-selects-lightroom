@@ -60,6 +60,10 @@ local function showRunDialog(context)
     local providerLabel
     if current.provider == "claude" then
         providerLabel = "Claude API — " .. current.claudeModel
+    elseif current.provider == "openai" then
+        providerLabel = "OpenAI API — " .. current.openaiModel
+    elseif current.provider == "gemini" then
+        providerLabel = "Gemini API — " .. current.geminiModel
     else
         providerLabel = "Ollama — " .. current.model
     end

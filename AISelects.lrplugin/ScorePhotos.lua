@@ -66,8 +66,12 @@ function Logger:init(settings)
     if settings.provider == "ollama" then
         self:log("Model: " .. settings.model)
         self:log("Ollama URL: " .. settings.ollamaUrl)
-    else
+    elseif settings.provider == "claude" then
         self:log("Model: " .. settings.claudeModel)
+    elseif settings.provider == "openai" then
+        self:log("Model: " .. settings.openaiModel)
+    elseif settings.provider == "gemini" then
+        self:log("Model: " .. settings.geminiModel)
     end
     self:log("Render size: " .. tostring(settings.renderSize) .. "px")
     self:log("Skip scored: " .. tostring(settings.skipScored))
@@ -126,6 +130,12 @@ local function scorePhoto(photo, settings, imageIndex)
     if settings.provider == "claude" then
         raw, err = Engine.queryClaude(img, prompt, settings.claudeModel,
             settings.claudeApiKey, settings.timeoutSecs)
+    elseif settings.provider == "openai" then
+        raw, err = Engine.queryOpenAI(img, prompt, settings.openaiModel,
+            settings.openaiApiKey, settings.timeoutSecs)
+    elseif settings.provider == "gemini" then
+        raw, err = Engine.queryGemini(img, prompt, settings.geminiModel,
+            settings.geminiApiKey, settings.timeoutSecs)
     else
         raw, err = Engine.queryOllama(img, prompt, settings.model,
             settings.ollamaUrl, settings.timeoutSecs)
@@ -182,10 +192,20 @@ local function runScoring(context)
         return nil
     end
 
-    -- Validate Claude API key
+    -- Validate API keys
     if SETTINGS.provider == "claude" and (SETTINGS.claudeApiKey == nil or SETTINGS.claudeApiKey == "") then
         LrDialogs.message("AI Selects",
             "Claude API selected but no API key configured.\n\nOpen Settings and enter your Anthropic API key.", "warning")
+        return nil
+    end
+    if SETTINGS.provider == "openai" and (SETTINGS.openaiApiKey == nil or SETTINGS.openaiApiKey == "") then
+        LrDialogs.message("AI Selects",
+            "OpenAI API selected but no API key configured.\n\nOpen Settings and enter your OpenAI API key.", "warning")
+        return nil
+    end
+    if SETTINGS.provider == "gemini" and (SETTINGS.geminiApiKey == nil or SETTINGS.geminiApiKey == "") then
+        LrDialogs.message("AI Selects",
+            "Gemini API selected but no API key configured.\n\nOpen Settings and enter your Google AI API key.", "warning")
         return nil
     end
 
@@ -226,8 +246,21 @@ local function runScoring(context)
     log:init(SETTINGS)
     log:log("Scoring prompt: " .. Engine.SCORING_PROMPT)
 
-    local modelName = SETTINGS.provider == "claude" and SETTINGS.claudeModel or SETTINGS.model
-    local providerLabel = SETTINGS.provider == "claude" and "Claude API" or "Ollama"
+    local modelName
+    if SETTINGS.provider == "claude" then
+        modelName = SETTINGS.claudeModel
+    elseif SETTINGS.provider == "openai" then
+        modelName = SETTINGS.openaiModel
+    elseif SETTINGS.provider == "gemini" then
+        modelName = SETTINGS.geminiModel
+    else
+        modelName = SETTINGS.model
+    end
+    local providerLabels = {
+        claude = "Claude API", openai = "OpenAI API",
+        gemini = "Gemini API", ollama = "Ollama",
+    }
+    local providerLabel = providerLabels[SETTINGS.provider] or "Ollama"
     local progress = LrProgressScope({
         title           = "AI Selects (" .. providerLabel .. " - " .. modelName .. ")",
         functionContext = context,

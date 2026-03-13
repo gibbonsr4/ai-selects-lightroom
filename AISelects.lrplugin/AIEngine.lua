@@ -299,6 +299,8 @@ function M.prepareImage(photo, ts, provider, renderSize)
         renderDim = renderSize
     elseif provider == "claude" then
         renderDim = 1568
+    elseif provider == "openai" or provider == "gemini" then
+        renderDim = 1024
     else
         renderDim = 1024
     end
@@ -595,6 +597,135 @@ function M.queryClaude(img, prompt, claudeModel, apiKey, timeoutSecs)
     return nil, "Unexpected Claude response: " .. tostring(result):sub(1, 200)
 end
 
+-- ── OpenAI API provider ────────────────────────────────────────────────
+function M.queryOpenAI(img, prompt, openaiModel, apiKey, timeoutSecs)
+    local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+    local encodeOk, body = pcall(json.encode, {
+        model      = openaiModel,
+        max_tokens = 1024,
+        messages   = {{
+            role    = "user",
+            content = {
+                {
+                    type      = "image_url",
+                    image_url = {
+                        url    = "data:image/jpeg;base64," .. img.base64,
+                        detail = "high",
+                    },
+                },
+                {
+                    type = "text",
+                    text = prompt,
+                },
+            },
+        }}
+    })
+    if not encodeOk then return nil, "JSON encode failed: " .. tostring(body) end
+
+    local cleanKey = apiKey:gsub("%s+", "")
+
+    local tmpCfg = M.TEMP_DIR .. "/ai_sel_cfg_" .. ts .. ".txt"
+    local tmpIn  = M.TEMP_DIR .. "/ai_sel_req_" .. ts .. ".json"
+    local tmpOut = M.TEMP_DIR .. "/ai_sel_resp_" .. ts .. ".json"
+
+    if not M.writeCurlConfig(tmpCfg, "https://api.openai.com/v1/chat/completions", {
+        "Authorization: Bearer " .. cleanKey,
+        "Content-Type: application/json",
+    }, timeoutSecs) then
+        return nil, "Could not write curl config file"
+    end
+
+    local fh = io.open(tmpIn, "w")
+    if not fh then return nil, "Could not write temp file: " .. tmpIn end
+    fh:write(body); fh:close()
+
+    local result, err = M.curlPost(tmpCfg, tmpIn, tmpOut, img.fileSize, timeoutSecs)
+    if not result then return nil, err end
+
+    local ok, decoded = pcall(function() return json.decode(result) end)
+    if not ok or type(decoded) ~= "table" then
+        return nil, "Could not parse OpenAI response: " .. tostring(result):sub(1, 200)
+    end
+
+    if decoded.error then
+        return nil, "OpenAI API error: " .. (decoded.error.message or "Unknown")
+    end
+
+    if decoded.choices and decoded.choices[1] and decoded.choices[1].message then
+        return decoded.choices[1].message.content, nil
+    end
+
+    return nil, "Unexpected OpenAI response: " .. tostring(result):sub(1, 200)
+end
+
+-- ── Gemini API provider ────────────────────────────────────────────────
+function M.queryGemini(img, prompt, geminiModel, apiKey, timeoutSecs)
+    local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+    local encodeOk, body = pcall(json.encode, {
+        contents = {{
+            parts = {
+                {
+                    inline_data = {
+                        mime_type = "image/jpeg",
+                        data      = img.base64,
+                    },
+                },
+                {
+                    text = prompt,
+                },
+            },
+        }},
+        generationConfig = {
+            maxOutputTokens = 1024,
+        },
+    })
+    if not encodeOk then return nil, "JSON encode failed: " .. tostring(body) end
+
+    local cleanKey = apiKey:gsub("%s+", "")
+    local url = string.format(
+        "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
+        geminiModel, cleanKey
+    )
+
+    local tmpCfg = M.TEMP_DIR .. "/ai_sel_cfg_" .. ts .. ".txt"
+    local tmpIn  = M.TEMP_DIR .. "/ai_sel_req_" .. ts .. ".json"
+    local tmpOut = M.TEMP_DIR .. "/ai_sel_resp_" .. ts .. ".json"
+
+    if not M.writeCurlConfig(tmpCfg, url, {
+        "Content-Type: application/json",
+    }, timeoutSecs) then
+        return nil, "Could not write curl config file"
+    end
+
+    local fh = io.open(tmpIn, "w")
+    if not fh then return nil, "Could not write temp file: " .. tmpIn end
+    fh:write(body); fh:close()
+
+    local result, err = M.curlPost(tmpCfg, tmpIn, tmpOut, img.fileSize, timeoutSecs)
+    if not result then return nil, err end
+
+    local ok, decoded = pcall(function() return json.decode(result) end)
+    if not ok or type(decoded) ~= "table" then
+        return nil, "Could not parse Gemini response: " .. tostring(result):sub(1, 200)
+    end
+
+    if decoded.error then
+        return nil, "Gemini API error: " .. (decoded.error.message or "Unknown")
+    end
+
+    if decoded.candidates and decoded.candidates[1]
+       and decoded.candidates[1].content
+       and decoded.candidates[1].content.parts then
+        for _, part in ipairs(decoded.candidates[1].content.parts) do
+            if part.text then
+                return part.text, nil
+            end
+        end
+    end
+
+    return nil, "Unexpected Gemini response: " .. tostring(result):sub(1, 200)
+end
+
 -- ── Perceptual hashing (dHash) via sips ─────────────────────────────────
 -- Computes a 64-bit difference hash for visual duplicate detection.
 -- Uses macOS built-in `sips` to resize to 9x8 BMP, then parses the BMP
@@ -856,6 +987,113 @@ function M.queryClaudeText(prompt, claudeModel, apiKey, timeoutSecs)
     end
 
     return nil, "Unexpected Claude response: " .. tostring(result):sub(1, 200)
+end
+
+function M.queryOpenAIText(prompt, openaiModel, apiKey, timeoutSecs)
+    local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+    local encodeOk, body = pcall(json.encode, {
+        model      = openaiModel,
+        max_tokens = 8192,
+        messages   = {{
+            role    = "user",
+            content = prompt,
+        }}
+    })
+    if not encodeOk then return nil, "JSON encode failed: " .. tostring(body) end
+
+    local cleanKey = apiKey:gsub("%s+", "")
+
+    local tmpCfg = M.TEMP_DIR .. "/ai_sel_cfg_" .. ts .. ".txt"
+    local tmpIn  = M.TEMP_DIR .. "/ai_sel_req_" .. ts .. ".json"
+    local tmpOut = M.TEMP_DIR .. "/ai_sel_resp_" .. ts .. ".json"
+
+    if not M.writeCurlConfig(tmpCfg, "https://api.openai.com/v1/chat/completions", {
+        "Authorization: Bearer " .. cleanKey,
+        "Content-Type: application/json",
+    }, timeoutSecs) then
+        return nil, "Could not write curl config file"
+    end
+
+    local fh = io.open(tmpIn, "w")
+    if not fh then return nil, "Could not write temp file: " .. tmpIn end
+    fh:write(body); fh:close()
+
+    local result, err = M.curlPost(tmpCfg, tmpIn, tmpOut, 0, timeoutSecs)
+    if not result then return nil, err end
+
+    local ok, decoded = pcall(function() return json.decode(result) end)
+    if not ok or type(decoded) ~= "table" then
+        return nil, "Could not parse OpenAI response: " .. tostring(result):sub(1, 200)
+    end
+
+    if decoded.error then
+        return nil, "OpenAI API error: " .. (decoded.error.message or "Unknown")
+    end
+
+    if decoded.choices and decoded.choices[1] and decoded.choices[1].message then
+        return decoded.choices[1].message.content, nil
+    end
+
+    return nil, "Unexpected OpenAI response: " .. tostring(result):sub(1, 200)
+end
+
+function M.queryGeminiText(prompt, geminiModel, apiKey, timeoutSecs)
+    local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+    local encodeOk, body = pcall(json.encode, {
+        contents = {{
+            parts = {
+                { text = prompt },
+            },
+        }},
+        generationConfig = {
+            maxOutputTokens = 8192,
+        },
+    })
+    if not encodeOk then return nil, "JSON encode failed: " .. tostring(body) end
+
+    local cleanKey = apiKey:gsub("%s+", "")
+    local url = string.format(
+        "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
+        geminiModel, cleanKey
+    )
+
+    local tmpCfg = M.TEMP_DIR .. "/ai_sel_cfg_" .. ts .. ".txt"
+    local tmpIn  = M.TEMP_DIR .. "/ai_sel_req_" .. ts .. ".json"
+    local tmpOut = M.TEMP_DIR .. "/ai_sel_resp_" .. ts .. ".json"
+
+    if not M.writeCurlConfig(tmpCfg, url, {
+        "Content-Type: application/json",
+    }, timeoutSecs) then
+        return nil, "Could not write curl config file"
+    end
+
+    local fh = io.open(tmpIn, "w")
+    if not fh then return nil, "Could not write temp file: " .. tmpIn end
+    fh:write(body); fh:close()
+
+    local result, err = M.curlPost(tmpCfg, tmpIn, tmpOut, 0, timeoutSecs)
+    if not result then return nil, err end
+
+    local ok, decoded = pcall(function() return json.decode(result) end)
+    if not ok or type(decoded) ~= "table" then
+        return nil, "Could not parse Gemini response: " .. tostring(result):sub(1, 200)
+    end
+
+    if decoded.error then
+        return nil, "Gemini API error: " .. (decoded.error.message or "Unknown")
+    end
+
+    if decoded.candidates and decoded.candidates[1]
+       and decoded.candidates[1].content
+       and decoded.candidates[1].content.parts then
+        for _, part in ipairs(decoded.candidates[1].content.parts) do
+            if part.text then
+                return part.text, nil
+            end
+        end
+    end
+
+    return nil, "Unexpected Gemini response: " .. tostring(result):sub(1, 200)
 end
 
 -- ── Parse story mode AI response ────────────────────────────────────────

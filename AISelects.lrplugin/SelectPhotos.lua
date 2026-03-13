@@ -487,11 +487,16 @@ local function selectStory(pool, settings, catalog)
     local metadataItems = buildMetadataSummary(pool, faceMap)
 
     -- Context window check: pre-filter if metadata exceeds model's context limit.
-    -- Claude models handle ~150K tokens safely; local Ollama models vary widely
+    -- Cloud models handle large contexts; local Ollama models vary widely
     -- so we use a conservative 6K token limit to avoid silent truncation.
     local summaryJson = json.encode(metadataItems)
     local estimatedTokens = #summaryJson / 4
-    local tokenLimit = (settings.provider == "claude") and 150000 or 6000
+    local tokenLimits = {
+        claude = 150000,
+        openai = 100000,   -- GPT-4.1 has 1M context but 100K is practical
+        gemini = 800000,   -- Gemini Flash has 1M context
+    }
+    local tokenLimit = tokenLimits[settings.provider] or 6000
 
     if estimatedTokens > tokenLimit then
         -- Pre-filter: sort by composite score, take top candidates that fit
@@ -520,7 +525,7 @@ local function selectStory(pool, settings, catalog)
         if estimatedTokens > tokenLimit and candidateCount <= targetCount then
             return nil, string.format(
                 "Too many photos for this model's context window (%d photos, ~%dK tokens). " ..
-                "Reduce the number of source photos or switch to a cloud provider like Claude.",
+                "Reduce the number of source photos or switch to a cloud provider (Claude, OpenAI, or Gemini).",
                 #pool, math.floor(estimatedTokens / 1000))
         end
     end
@@ -565,6 +570,12 @@ local function selectStory(pool, settings, catalog)
     if settings.provider == "claude" then
         response, queryErr = Engine.queryClaudeText(
             prompt, settings.claudeModel, settings.claudeApiKey, settings.timeoutSecs)
+    elseif settings.provider == "openai" then
+        response, queryErr = Engine.queryOpenAIText(
+            prompt, settings.openaiModel, settings.openaiApiKey, settings.timeoutSecs)
+    elseif settings.provider == "gemini" then
+        response, queryErr = Engine.queryGeminiText(
+            prompt, settings.geminiModel, settings.geminiApiKey, settings.timeoutSecs)
     else
         response, queryErr = Engine.queryOllamaText(
             prompt, settings.model, settings.ollamaUrl, settings.timeoutSecs)
@@ -596,6 +607,12 @@ local function selectStory(pool, settings, catalog)
         if settings.provider == "claude" then
             retryResp, retryErr = Engine.queryClaudeText(
                 retryPrompt, settings.claudeModel, settings.claudeApiKey, settings.timeoutSecs)
+        elseif settings.provider == "openai" then
+            retryResp, retryErr = Engine.queryOpenAIText(
+                retryPrompt, settings.openaiModel, settings.openaiApiKey, settings.timeoutSecs)
+        elseif settings.provider == "gemini" then
+            retryResp, retryErr = Engine.queryGeminiText(
+                retryPrompt, settings.geminiModel, settings.geminiApiKey, settings.timeoutSecs)
         else
             retryResp, retryErr = Engine.queryOllamaText(
                 retryPrompt, settings.model, settings.ollamaUrl, settings.timeoutSecs)
