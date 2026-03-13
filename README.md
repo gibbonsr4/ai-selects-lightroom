@@ -204,6 +204,10 @@ AISelects.lrplugin/
 models.json                — Remote model definitions
 ```
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the full feature status and future plans.
+
 ## License
 
 MIT
