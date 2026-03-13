@@ -319,14 +319,6 @@ local function validateAndPrepare()
         return nil
     end
 
-    if #toProcess > 50 then
-        local confirm = LrDialogs.confirm(
-            "Score " .. #toProcess .. " Photos?",
-            "This may take several minutes depending on your hardware and AI provider.\n\nProceed?",
-            "Proceed", "Cancel")
-        if confirm ~= "ok" then return nil end
-    end
-
     -- Clean up orphaned temp files from interrupted runs
     pcall(function()
         LrTasks.execute("rm -f /tmp/ai_sel_req_* /tmp/ai_sel_resp_* /tmp/ai_sel_cfg_* 2>/dev/null")
