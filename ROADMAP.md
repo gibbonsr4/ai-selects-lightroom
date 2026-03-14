@@ -6,64 +6,73 @@ Existing culling tools handle the obvious rejects (thousands → hundreds). AI S
 
 Everything on this roadmap serves that goal: make the output good enough to use directly.
 
-Updated 2026-03-12.
+Updated 2026-03-14.
 
 ---
 
 ## What's Built
 
-### Scoring
-- Vision AI scoring via Claude API or local Ollama models
-- Technical (1-10), aesthetic (1-10), content description, category, narrative role, eye quality, reject flag
-- Composite score with configurable quality/aesthetic weights and eye quality adjustments
+### Scoring (Pass 1)
+- Vision AI scoring via Claude, OpenAI, Gemini, or local Ollama models
+- Four scoring dimensions: technical (1-10), composition (1-10), emotion (1-10), moment (1-10)
+- Content description, category, narrative role, eye quality, reject flag
+- Batch scoring with relative ranking across photos
+- Composite score with configurable technical/aesthetic weights and eye quality adjustments
+- Perceptual hash (dHash) computed per photo for visual dedup
 - Skip-already-scored for incremental workflows
+- Pre-scoring hints for user context ("this is from 2007", "the older man is my dad")
+- Real-time API cost tracking per batch and cumulative
 
 ### Selection — Best Of
 - Quality-driven culling with temporal distribution across the timeline
 - Category-aware proportional distribution
 - Face coverage — every named person appears at least once
 
-### Selection — Story Mode
+### Selection — Story Mode (v3 Multi-Pass Pipeline)
+- Mid-run story dialog with AI-prepopulated summary, editable story prompt, emphasis field, and adjustable target count
 - 8 genre presets (Family Vacation, Documentary Travel, Wedding, Portrait Session, Editorial, Landscape Portfolio, Fun/Playful, Custom)
-- Text-only metadata summary sent to AI (no images — fast and cheap)
-- Custom instructions field appends to any preset
-- Gap detection and filling for missing people, narrative roles, timeline coverage
-- Sequence numbering for story ordering
-- Fallback to Best Of if AI response fails
+- Pass 2: Story Assembly — text-only AI call generates beat list from metadata
+- Pass 3A: Code pre-filter — hard constraints per beat (time window, category, people)
+- Pass 3B: AI text ranking — orders candidates by narrative fit
+- Pass 4: Beat Casting — vision-based per-beat selection (cloud providers)
+- Pass 5: Story Review — vision review of full selection for coherence
+- Pass 6: Swap Resolution — targeted vision comparisons for flagged positions
+- Fallback to Best Of if story pipeline fails
 
-### Pipeline
-- Burst dedup (EXIF timestamps) and visual dedup (perceptual hashing via dHash)
-- Face detection via Lightroom's catalog database (read-only)
+### Deduplication (Three Layers)
+- Burst dedup via EXIF timestamps (configurable threshold)
+- Perceptual hashing via dHash (9×8 BMP, 64-bit fingerprint, Hamming distance)
+- Content description similarity (word overlap + time window)
+
+### Infrastructure
+- Face detection via Lightroom's catalog database (read-only SQLite queries)
+- Image cache for vision passes — renders once, reused across Passes 4-6
+- API cost tracking with per-model pricing for Claude, OpenAI, Gemini
 - Non-destructive output — creates Collections, never modifies originals
 - Auto-navigation to new collection after creation
-- Run dialog for per-session config, separate Settings for provider/model setup
-- Progress bar with step captions
+- Progress bar with per-pass captions
 - Zero external dependencies — macOS built-in tools only (sips, sqlite3, curl)
 
 ---
 
 ## Up Next
 
-### Fix Perceptual Hashing
-The sips BMP pipeline produces parse warnings on many images, making visual dedup non-functional (falls back to burst dedup only). This directly impacts selection quality — near-duplicates slip through into the final set. Investigate alternative image format or hashing approach.
+### Scene Inventory Pass (#9)
+**The biggest quality issue.** Story mode selections frequently include thematically duplicate content (e.g., multiple similar group shots) while missing distinct scenes that should be represented. No single pass currently has a birds-eye view of the full visual set.
 
-### Gap Fill Transparency
-When the tool pulls in a weaker photo to fill a narrative gap (missing person, missing role), the user should know why it's there. Use the existing `aiSelectsStoryNote` metadata field — gap fills get a note like "Gap fill: ensures Sarah appears in the edit." The info is visible in the AI Selects metadata panel when you inspect the photo, but doesn't touch color labels, star ratings, or anything else catalog-wide.
+**Solution:** Add a scene clustering pass before story arc generation. Send all content descriptions + timestamps to the AI in a single text call to produce a scene inventory ("4 dinner scenes, 12 ceremony shots, 3 candids by the pool"). Feed this to the story assembly pass so it selects across clusters, ensuring coverage and avoiding redundancy.
 
-### Alternates Collection (Opt-In)
-Optional feature, off by default — a checkbox in the run dialog. When enabled, creates a second collection alongside the primary edit containing the next-best runners-up. Users can compare in Survey mode and swap between collections using familiar LR workflows. No custom UI needed.
+### Standalone Select Story Support (#3)
+When running Select separately (after scoring), there's no mid-run story dialog — falls back to v2 path. Need to add the story dialog with prepopulation from catalog metadata.
 
-### People Balancing
-Face coverage currently guarantees presence (at least one photo per named person) but not balance. A wedding album where the bride appears 30 times and the groom 5 times is a bad deliverable. Add proportional representation logic that distributes selections more evenly across named people, weighted by their frequency in the source set.
+### Snapshot Persistence (#4)
+Batch snapshots (scene descriptions from scoring) exist only in memory. Standalone Select gets no snapshots, degrading story assembly quality. Options: persist to metadata field (requires schemaVersion bump) or accept the fallback.
 
-### Additional AI Providers
-Add OpenAI (GPT-4V) and Google Gemini as cloud provider options alongside Claude. Cloud vision models are significantly better than most local models at scoring — faster and more accurate. Photographers will have preferences or existing API keys. The scoring prompt and response parsing are provider-agnostic; this is primarily a new API transport layer per provider.
+### Cumulative Batch Context (#5)
+Pass prior batch snapshots to subsequent scoring batches so the AI builds cumulative context of the shoot. Also: confirm chronological sort order, flag continuity issues.
 
-### Scoring Speed
-Scoring is the bottleneck. 500 photos scored one-by-one takes a long time. Investigate:
-- Parallel requests (multiple concurrent API calls)
-- Batch scoring (multiple images per call where the API supports it)
-- Smarter skip logic (hash-based change detection to avoid re-scoring unchanged photos)
+### End-to-End Testing (#8)
+Passes 4-6 (Beat Casting, Story Review, Swap Resolution) need end-to-end testing against real photo sets.
 
 ---
 
@@ -72,7 +81,9 @@ Scoring is the bottleneck. 500 photos scored one-by-one takes a long time. Inves
 Ideas worth exploring once the core is solid:
 
 - **Score quality tuning** — prompt refinements, model-specific calibration, per-category scoring adjustments
-- **Story mode improvements** — better handling of very large photo sets (1000+), two-pass narrative refinement, preset-specific scoring weight overrides
+- **Third scoring dimension** — interest/impact/story relevance as a distinct axis (#2)
+- **People balancing** — proportional representation across named people, not just presence
+- **Alternates collection** — optional second collection with runners-up for easy comparison
 - **Smart Preview scoring** — score from Smart Previews when originals are offline
-- **Collection sets** — organize AI Selects output collections into a collection set for cleaner catalog management
-- **Category normalization** — tighten the scoring prompt to return consistent categories, or normalize in post-processing
+- **Collection sets** — organize AI Selects output collections into a collection set
+- **Parallel API requests** — concurrent scoring calls for speed

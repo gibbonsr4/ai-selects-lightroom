@@ -135,9 +135,8 @@ local function writeScores(catalog, photo, scores, composite, phash, batchId, fi
             if scores.eye_quality then
                 photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsEyeQuality', scores.eye_quality)
             end
-            if scores.narrative_role then
-                photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsNarrativeRole', scores.narrative_role)
-            end
+            -- narrative_role NOT written during Pass 1 scoring.
+            -- Assigned during story assembly (Pass 2) when full context is available.
             if phash then
                 photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsPhash', phash)
             end
@@ -281,6 +280,56 @@ local function runScoring(context, config)
         #photosToScore, totalBatches,
         BatchStrategy.getBatchSize(provider, SETTINGS.batchSize)))
 
+    -- ── Capture time continuity check ────────────────────────────────────
+    -- Warn about missing times and large gaps that may affect scoring quality.
+    do
+        local noTimeCount = 0
+        local captureTimes = {}
+        -- Flatten batches to get chronological order
+        for _, batch in ipairs(batches) do
+            for _, photo in ipairs(batch) do
+                local ct = photo:getRawMetadata('dateTimeOriginal')
+                if ct then
+                    captureTimes[#captureTimes + 1] = ct
+                else
+                    noTimeCount = noTimeCount + 1
+                end
+            end
+        end
+
+        if noTimeCount > 0 then
+            log:log(string.format("⚠ %d of %d photos have no capture time — "
+                .. "these will sort to the end and may reduce scoring/story quality.",
+                noTimeCount, #photosToScore))
+        end
+
+        -- Check for large time gaps (>4 hours) that might indicate mixed shoots
+        if #captureTimes >= 2 then
+            table.sort(captureTimes)
+            local gaps = {}
+            for i = 2, #captureTimes do
+                local gapSecs = captureTimes[i] - captureTimes[i - 1]
+                if gapSecs > 14400 then  -- 4 hours
+                    local gapHours = math.floor(gapSecs / 3600)
+                    local t1 = LrDate.timeToUserFormat(captureTimes[i - 1], "%Y-%m-%d %H:%M")
+                    local t2 = LrDate.timeToUserFormat(captureTimes[i], "%Y-%m-%d %H:%M")
+                    gaps[#gaps + 1] = string.format("%dh gap: %s → %s", gapHours, t1, t2)
+                end
+            end
+            if #gaps > 0 then
+                log:log(string.format("⚠ %d large time gap(s) detected — "
+                    .. "this may span multiple shoots or days:", #gaps))
+                for _, g in ipairs(gaps) do
+                    log:log("  " .. g)
+                end
+                log:log("  This is normal for multi-day trips but may affect batch continuity.")
+            end
+        end
+    end
+
+    -- Reset cost tracker for this run
+    Engine.resetCostTracker()
+
     -- Track results
     local successCount = 0
     local errorLog = {}
@@ -331,7 +380,8 @@ local function runScoring(context, config)
         local imageLabels = {}
         local photoIds = {}
         local photoTimestamps = {}
-        -- Positional lookup: maps 1-based index in images array → { photo, filename }
+        local photoExifData = {}
+        -- Positional lookup: maps 1-based index in images array → { photo, filename, id, exif }
         local photoByPosition = {}
         local renderErrors = {}
 
@@ -345,6 +395,18 @@ local function runScoring(context, config)
                 timestamp = LrDate.timeToUserFormat(captureTime, "%Y-%m-%d %H:%M:%S")
             end
 
+            -- Read EXIF data for scoring context
+            local exifParts = {}
+            local isoVal = photo:getRawMetadata('isoSpeedRating')
+            if isoVal then exifParts[#exifParts + 1] = "ISO " .. tostring(isoVal) end
+            local shutterVal = photo:getFormattedMetadata('shutterSpeed')
+            if shutterVal and shutterVal ~= "" then exifParts[#exifParts + 1] = shutterVal end
+            local apertureVal = photo:getFormattedMetadata('aperture')
+            if apertureVal and apertureVal ~= "" then exifParts[#exifParts + 1] = apertureVal end
+            local focalVal = photo:getFormattedMetadata('focalLength')
+            if focalVal and focalVal ~= "" then exifParts[#exifParts + 1] = focalVal end
+            local exifStr = #exifParts > 0 and table.concat(exifParts, ", ") or nil
+
             local ts = tostring(math.floor(LrDate.currentTime() * 1000))
                 .. "_b" .. batchIdx .. "_" .. i
             local img, err = Engine.prepareImage(photo, ts, provider, SETTINGS.renderSize)
@@ -355,7 +417,8 @@ local function runScoring(context, config)
                 imageLabels[pos] = string.format("Photo %d of %d", pos, #batch)
                 photoIds[#photoIds + 1] = id
                 photoTimestamps[#photoTimestamps + 1] = timestamp
-                photoByPosition[pos] = { photo = photo, filename = filename, id = id }
+                photoExifData[#photoExifData + 1] = exifStr or ""
+                photoByPosition[pos] = { photo = photo, filename = filename, id = id, exif = exifStr }
             else
                 renderErrors[#renderErrors + 1] = filename .. ": " .. (err or "render failed")
                 log:log("  [FAIL]  " .. filename .. "  ->  " .. (err or "render failed"))
@@ -400,10 +463,10 @@ local function runScoring(context, config)
             end
         end
 
-        -- 3. Build the scoring prompt
+        -- 3. Build the scoring prompt (pass prior snapshots for narrative context)
         local prompt = Engine.buildBatchScoringPrompt(
-            photoIds, photoTimestamps, anchors,
-            SETTINGS.nitpickyScale, includeSnapshots
+            photoIds, photoTimestamps, photoExifData, anchors,
+            SETTINGS.nitpickyScale, includeSnapshots, SETTINGS.preHints, allSnapshots
         )
 
         log:log(string.format("  Prompt length: %d chars, %d images + %d anchors",
@@ -456,6 +519,7 @@ local function runScoring(context, config)
 
         log:log(string.format("  Parsed %d scores%s",
             #batchScores, snapshot and " + snapshot" or ""))
+        log:log("  Cost so far: " .. Engine.formatCostSummary())
 
         -- 6. Store snapshot (if present)
         if snapshot then
@@ -469,7 +533,7 @@ local function runScoring(context, config)
                 }
             end
             allSnapshots[#allSnapshots + 1] = snapshot
-            log:log("  Snapshot: " .. tostring(snapshot.scene or ""):sub(1, 100))
+            log:log("  Snapshot: " .. tostring(snapshot.scene or ""):sub(1, 300))
         end
 
         -- 7. Write scores to metadata — POSITIONAL mapping (score[i] → photo[i])
@@ -494,7 +558,15 @@ local function runScoring(context, config)
                 weights, scoreEntry.eye_quality
             )
 
+            -- Compute perceptual hash for visual duplicate detection
             local phash = nil
+            local phashTs = tostring(batchIdx) .. "_" .. tostring(pos)
+            local hashVal, hashErr = Engine.computePhash(photo, phashTs)
+            if hashVal then
+                phash = hashVal
+            else
+                log:log("  Phash skipped for " .. filename .. ": " .. tostring(hashErr))
+            end
 
             -- Write to catalog
             LrTasks.yield()
@@ -578,7 +650,7 @@ local function runScoring(context, config)
         log:log(string.format("Story snapshots collected: %d", #allSnapshots))
         for _, snap in ipairs(allSnapshots) do
             log:log(string.format("  Batch %d: %s", snap.batchIndex or 0,
-                tostring(snap.scene or ""):sub(1, 100)))
+                tostring(snap.scene or ""):sub(1, 300)))
         end
     end
 
@@ -651,6 +723,12 @@ local function runScoring(context, config)
                 " %2d | %-" .. barW .. "s %d", b, bar, buckets[b])
         end
     end
+
+    -- Cost summary
+    local costSummary = Engine.formatCostSummary()
+    lines[#lines + 1] = "\n-- Cost --"
+    lines[#lines + 1] = costSummary
+    log:log("Pass 1 cost: " .. costSummary)
 
     if log.enabled and log.filePath then
         lines[#lines + 1] = "\nLog saved to: " .. log.filePath

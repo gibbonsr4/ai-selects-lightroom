@@ -60,6 +60,117 @@ M.VISION_MODELS = {
 M.MODELS_JSON_URL =
     "https://raw.githubusercontent.com/gibbonsr4/ai-selects-lightroom/main/models.json"
 
+-- == Cost tracking ============================================================
+-- Per-provider pricing (USD per 1M tokens). Updated as of 2025-03.
+-- Vision input tokens are estimated from image size (provider-specific).
+local PRICING = {
+    claude = {
+        -- Claude Haiku 3.5
+        ["claude-haiku-4-5-20251001"] = { input = 0.80, output = 4.00 },
+        -- Claude Sonnet
+        ["claude-sonnet-4-20250514"]  = { input = 3.00, output = 15.00 },
+        -- Fallback for unknown Claude models
+        _default                       = { input = 3.00, output = 15.00 },
+    },
+    openai = {
+        ["gpt-4.1-mini"]  = { input = 0.40, output = 1.60 },
+        ["gpt-4.1"]       = { input = 2.00, output = 8.00 },
+        ["gpt-4.1-nano"]  = { input = 0.10, output = 0.40 },
+        ["gpt-4o"]        = { input = 2.50, output = 10.00 },
+        ["gpt-4o-mini"]   = { input = 0.15, output = 0.60 },
+        _default           = { input = 2.50, output = 10.00 },
+    },
+    gemini = {
+        ["gemini-2.5-flash"]   = { input = 0.15, output = 0.60 },
+        ["gemini-2.5-pro"]     = { input = 1.25, output = 10.00 },
+        ["gemini-2.0-flash"]   = { input = 0.10, output = 0.40 },
+        _default                = { input = 0.15, output = 0.60 },
+    },
+}
+
+-- Shared cost accumulator — reset per run via M.resetCostTracker()
+local costTracker = {
+    totalInputTokens  = 0,
+    totalOutputTokens = 0,
+    totalCost         = 0,
+    callCount         = 0,
+    breakdown         = {},  -- array of {pass, inputTokens, outputTokens, cost}
+}
+
+function M.resetCostTracker()
+    costTracker.totalInputTokens  = 0
+    costTracker.totalOutputTokens = 0
+    costTracker.totalCost         = 0
+    costTracker.callCount         = 0
+    costTracker.breakdown         = {}
+end
+
+-- Get pricing for a provider + model
+local function getPricing(provider, model)
+    local providerPricing = PRICING[provider]
+    if not providerPricing then return nil end
+    return providerPricing[model] or providerPricing._default
+end
+
+-- Record usage from an API response. Called internally by query functions.
+-- @param provider     "claude", "openai", "gemini"
+-- @param model        Model name string
+-- @param inputTokens  Number of input tokens
+-- @param outputTokens Number of output tokens
+-- @param passLabel    Optional string label (e.g., "Pass 1 batch 3", "Pass 4 beat 7")
+local function recordUsage(provider, model, inputTokens, outputTokens, passLabel)
+    if not inputTokens and not outputTokens then return end
+    local inp = inputTokens or 0
+    local out = outputTokens or 0
+
+    costTracker.totalInputTokens  = costTracker.totalInputTokens  + inp
+    costTracker.totalOutputTokens = costTracker.totalOutputTokens + out
+    costTracker.callCount         = costTracker.callCount + 1
+
+    local pricing = getPricing(provider, model)
+    if pricing then
+        local callCost = (inp * pricing.input + out * pricing.output) / 1000000
+        costTracker.totalCost = costTracker.totalCost + callCost
+        costTracker.breakdown[#costTracker.breakdown + 1] = {
+            pass         = passLabel or ("call " .. costTracker.callCount),
+            inputTokens  = inp,
+            outputTokens = out,
+            cost         = callCost,
+        }
+    end
+end
+
+-- Get current cost summary (for logging at milestones)
+function M.getCostSummary()
+    return {
+        totalInputTokens  = costTracker.totalInputTokens,
+        totalOutputTokens = costTracker.totalOutputTokens,
+        totalCost         = costTracker.totalCost,
+        callCount         = costTracker.callCount,
+    }
+end
+
+-- Format cost for log display
+function M.formatCost(cost)
+    if cost < 0.01 then
+        return string.format("$%.4f", cost)
+    else
+        return string.format("$%.2f", cost)
+    end
+end
+
+-- Format a full cost summary line for logging
+function M.formatCostSummary()
+    local s = costTracker
+    if s.callCount == 0 then return "No API calls made" end
+    return string.format("%d API calls | %dk input + %dk output tokens | %s total cost",
+        s.callCount,
+        math.floor(s.totalInputTokens / 1000),
+        math.floor(s.totalOutputTokens / 1000),
+        M.formatCost(s.totalCost))
+end
+
+
 -- == Nitpicky scale modifiers =================================================
 -- Prepended to the batch scoring prompt to calibrate expectations.
 local NITPICKY_CONTEXT = {
@@ -79,20 +190,29 @@ local NITPICKY_CONTEXT = {
 
 -- == Batch scoring prompt builder =============================================
 -- Builds the complete prompt for a multi-image batch scoring call.
--- @param photoIds      Array of string IDs for photos in this batch
--- @param timestamps    Array of string timestamps matching photoIds order
--- @param anchors       Array of anchor tables (from BatchStrategy.selectAnchors)
---                      or nil/empty for the first batch
--- @param nitpickyScale String: "consumer", "enthusiast", "professional"
+-- @param photoIds        Array of string IDs for photos in this batch
+-- @param timestamps      Array of string timestamps matching photoIds order
+-- @param exifData        Array of EXIF strings matching photoIds order
+-- @param anchors         Array of anchor tables (from BatchStrategy.selectAnchors)
+--                        or nil/empty for the first batch
+-- @param nitpickyScale   String: "consumer", "enthusiast", "professional"
 -- @param includeSnapshot Boolean: whether to request a story snapshot
+-- @param preHints        Optional string: user-provided context hints
+-- @param priorSnapshots  Optional array of snapshot tables from previous batches
 -- @return string  The complete prompt text
-function M.buildBatchScoringPrompt(photoIds, timestamps, anchors, nitpickyScale, includeSnapshot)
+function M.buildBatchScoringPrompt(photoIds, timestamps, exifData, anchors, nitpickyScale, includeSnapshot, preHints, priorSnapshots)
     local parts = {}
 
     -- Section 1: System context with nitpicky modifier
     parts[#parts + 1] = "SCORING CONTEXT\n"
     parts[#parts + 1] = (NITPICKY_CONTEXT[nitpickyScale] or NITPICKY_CONTEXT.consumer)
     parts[#parts + 1] = "\n\n"
+
+    -- Pre-hints from user (optional context)
+    if preHints and preHints ~= "" then
+        parts[#parts + 1] = "PHOTOGRAPHER'S NOTES\n"
+        parts[#parts + 1] = preHints .. "\n\n"
+    end
 
     -- Section 2: Anchor context (batches 2+)
     if anchors and #anchors > 0 then
@@ -116,14 +236,45 @@ function M.buildBatchScoringPrompt(photoIds, timestamps, anchors, nitpickyScale,
         parts[#parts + 1] = "A photo clearly worse than the low anchor should score lower.\n\n"
     end
 
+    -- Section 2b: Prior batch snapshots (cumulative narrative context)
+    if priorSnapshots and #priorSnapshots > 0 then
+        parts[#parts + 1] = "STORY SO FAR (snapshots from previous batches — use for narrative context):\n"
+        for i, snap in ipairs(priorSnapshots) do
+            local snapParts = {}
+            if snap.scene and snap.scene ~= "" then
+                snapParts[#snapParts + 1] = snap.scene
+            end
+            if snap.action and snap.action ~= "" then
+                snapParts[#snapParts + 1] = snap.action
+            end
+            if snap.people and type(snap.people) == "table" and #snap.people > 0 then
+                snapParts[#snapParts + 1] = "People: " .. table.concat(snap.people, ", ")
+            end
+            if snap.mood and snap.mood ~= "" then
+                snapParts[#snapParts + 1] = "Mood: " .. snap.mood
+            end
+            local timeStr = ""
+            if snap.timeRange then
+                timeStr = string.format(" (%s)", snap.timeRange.start or "")
+            end
+            parts[#parts + 1] = string.format("  Batch %d%s: %s\n",
+                snap.batchIndex or i, timeStr, table.concat(snapParts, ". "))
+        end
+        parts[#parts + 1] = "\n"
+    end
+
     -- Section 3: Photo list (positional — no IDs to confuse the model)
     parts[#parts + 1] = string.format("You will score %d NEW PHOTOS.\n", #photoIds)
     parts[#parts + 1] = "The photos are presented IN ORDER. Return your scores array in the SAME ORDER — "
     parts[#parts + 1] = "the first element in the scores array must be for the first photo, the second for the second photo, etc.\n"
     for i, id in ipairs(photoIds) do
         local ts = timestamps[i] or ""
-        if ts ~= "" then
-            parts[#parts + 1] = string.format("Photo %d: Timestamp %s\n", i, ts)
+        local exif = exifData and exifData[i] or ""
+        local details = {}
+        if ts ~= "" then details[#details + 1] = "Timestamp " .. ts end
+        if exif ~= "" then details[#details + 1] = exif end
+        if #details > 0 then
+            parts[#parts + 1] = string.format("Photo %d: %s\n", i, table.concat(details, " | "))
         else
             parts[#parts + 1] = string.format("Photo %d\n", i)
         end
@@ -264,22 +415,208 @@ Return ONLY the JSON array. No explanation, no markdown, no commentary.]]
 
 -- == Pass 2 refinement prompt template ========================================
 -- Used for focused per-beat comparisons in story mode.
-M.PASS2_PROMPT_TEMPLATE = [[You are comparing photos for a specific story moment.
+-- == v3 Story Prepopulation prompt ============================================
+-- Text-only call to synthesize batch snapshots + metadata into a natural-language
+-- story summary that the user can edit in the mid-run dialog.
+M.PREPOPULATE_PROMPT_TEMPLATE = [[Based on the following photo collection analysis, write a 3-4 sentence natural language summary that describes this photo collection as if you're describing it to the photographer. Write in second person ("you"). Make it feel like a conversation, not a data dump.
 
-Story beat: %BEAT%
-Narrative role: %ROLE%
-Editorial note: %NOTE%
+Batch snapshots (what the AI saw in each scoring batch):
+%%SNAPSHOT_SUMMARIES%%
 
-You are looking at %NUM_PHOTOS% photos. The first is the current selection, the rest are alternates.
-Which photo BEST serves as the %ROLE% for this moment: "%BEAT%"?
+People identified: %%PEOPLE_SUMMARY%%
+Categories: %%CATEGORY_SUMMARY%%
+Time range: %%TIME_RANGE%%
+Total photos: %%TOTAL_PHOTOS%%
+%%PRE_HINTS%%
 
-Consider:
-- How well does each photo capture this specific moment?
-- Which has stronger emotional resonance for this story beat?
-- Which better serves the narrative flow?
+Write ONLY the summary, nothing else. No JSON, no bullet points — just natural language.]]
 
-Return ONLY a JSON object:
-{"selected_id": "the_best_photo_id", "reason": "10-word explanation"}]]
+-- == v3 Story Assembly prompt (Pass 2) ========================================
+-- Text-only call: takes user story prompt + metadata rollup + snapshots → beat list.
+-- This is the "spread all photos on the table" moment.
+M.STORY_ASSEMBLY_PROMPT_TEMPLATE = [[You are an expert photo editor planning a curated photo story.
+
+## The Photographer's Story
+%%USER_STORY_PROMPT%%
+
+%%EMPHASIS%%
+
+## Event Timeline (from visual analysis of the photos)
+%%EVENT_TIMELINE%%
+
+## Collection Overview
+%%METADATA_ROLLUP%%
+
+## All Photos (text descriptions only — no images)
+%%ALL_PHOTOS%%
+
+## Task
+Plan a photo story of exactly %%TARGET_COUNT%% beats (one photo per beat). Each beat represents a moment in the story. You are designing the story structure — later, a vision model will look at candidate photos to pick the best match for each beat.
+
+For each beat, specify:
+- position: sequence number (1 to %%TARGET_COUNT%%)
+- beat: short name for this story moment (e.g., "Opening — Group establishing shot")
+- description: 1-2 sentences describing the ideal photo for this beat
+- narrative_role: one of [establishing, scene_setter, character_moment, action, detail, transition, emotional_peak, closing]
+- search_criteria: object with:
+  - must_have: array of requirements (e.g., ["group shot", "all 4 people"])
+  - prefer: array of preferences (e.g., ["morning light", "high emotion score"])
+  - avoid: array of things to avoid (e.g., ["similar to beat 1"])
+  - category_hint: array of preferred categories (e.g., ["portrait"])
+  - time_range: string hint like "early in the day" or "after lunch" (or "any")
+  - min_composite: minimum composite score threshold (number, e.g., 6.0)
+
+Also include:
+- category_targets: object mapping category names to target beat counts (e.g., {"portrait": "4-5 beats"})
+- people_targets: object mapping people/groups to minimum representation (e.g., {"All 4 together": "at least 2 beats"})
+
+## Constraints
+- Plan EXACTLY %%TARGET_COUNT%% beats
+- Distribute beats across the full timeline
+- Ensure category variety (portraits, action, landscapes, details)
+- Ensure people representation — every named person should appear in at least one beat
+- The story should have a clear arc: opening → development → highlights → closing
+- Reference the photographer's story and emphasis when prioritizing moments
+- Use the event timeline to ground beats in what actually happened
+- Set min_composite appropriately — hero shots should require higher scores, transitional shots can be lower
+
+Return ONLY valid JSON. No explanation, no markdown, no commentary.
+
+```json
+{
+  "story_title": "...",
+  "beats": [...],
+  "category_targets": {...},
+  "people_targets": {...}
+}
+```]]
+
+-- == v3 Candidate Ranking prompt (Pass 3B) ====================================
+-- Text-only call per beat: ranks pre-filtered candidates by semantic match.
+M.CANDIDATE_RANKING_PROMPT_TEMPLATE = [[CANDIDATE RANKING
+
+Beat %%BEAT_NUM%% of %%TOTAL_BEATS%%: "%%BEAT_DESCRIPTION%%"
+Narrative role: %%NARRATIVE_ROLE%%
+What to look for: %%SEARCH_CRITERIA%%
+
+Here are %%NUM_CANDIDATES%% candidate photos (text descriptions only). Rank the top 8 that best match this beat's requirements. If fewer than 8 candidates, rank all of them.
+
+CANDIDATES:
+%%CANDIDATE_LIST%%
+
+Return ONLY valid JSON:
+{"ranked": [1, 15, 7, 23, 4, 12, 9, 31], "reasoning": "Brief explanation of top picks"}
+
+The numbers in "ranked" are the candidate numbers listed above, in order from best match to worst. Return the NUMBERS, not photo IDs.]]
+
+
+-- == Beat Casting prompt (Pass 4 — vision) ====================================
+-- Per-beat vision call: AI sees candidate images and picks the best match.
+M.BEAT_CASTING_PROMPT_TEMPLATE = [[You are selecting a photo for a specific moment in a story.
+
+STORY CONTEXT:
+"%%STORY_PROMPT%%"
+
+THIS BEAT:
+Position %%BEAT_NUM%% of %%TOTAL_BEATS%%: "%%BEAT_DESCRIPTION%%"
+Narrative role: %%NARRATIVE_ROLE%%
+What to look for: %%MUST_HAVE%%
+Prefer: %%PREFER%%
+Avoid: %%AVOID%%
+
+%%PREVIOUS_SELECTIONS%%
+
+You are viewing %%NUM_CANDIDATES%% candidate photos IN ORDER for this beat.
+Select the ONE photo that best serves this beat.
+Also select a BACKUP in case the primary has issues.
+
+CRITICAL: Return the photo NUMBER (1-based position) as shown. The first photo you see is 1, the second is 2, etc.
+
+Return ONLY valid JSON:
+{
+  "primary": 1,
+  "backup": 3,
+  "reasoning": "Brief explanation of why this photo best serves the beat",
+  "flag": null
+}
+
+flag should be "duplicate_risk" if the primary looks too similar to a previous selection, "weak_match" if none of the candidates are great for this beat, or null if the match is good.]]
+
+
+-- == Story Review prompt (Pass 5 — vision) ====================================
+M.STORY_REVIEW_PROMPT_TEMPLATE = [[STORY REVIEW
+
+You are reviewing a photo story edit. The photographer described this story as:
+"%%STORY_PROMPT%%"
+
+The story was planned with these beats:
+%%BEAT_LIST%%
+
+%%BATCH_CONTEXT%%
+
+The photos below are shown IN STORY ORDER, corresponding to beats %%BEAT_RANGE%%.
+
+For each photo, assess:
+1. BEAT FIT: Does this photo deliver on what the beat asked for? (strong/adequate/weak)
+2. TECHNICAL: Any quality issues visible at this size? (ok/concern: [what])
+
+For the batch as a whole, assess:
+3. DUPLICATES: Are any two photos too visually similar? List pairs.
+4. GAPS: What's missing from the story? What moment or type of shot would improve it?
+5. PACING: Are there too many similar shots in a row?
+6. STORY COHERENCE: Does this sequence tell the story the photographer described? Rate 1-10.
+
+Return ONLY valid JSON:
+{
+  "photo_assessments": [
+    {"position": 1, "beat_fit": "strong", "technical": "ok", "notes": ""}
+  ],
+  "duplicates": [
+    {"positions": [4, 6], "description": "Nearly identical trophy poses"}
+  ],
+  "gaps": [
+    {"after_position": 7, "suggestion": "A scenic shot would break up the action"}
+  ],
+  "pacing_issues": [
+    {"positions": [3, 4, 5], "issue": "Three consecutive action shots"}
+  ],
+  "story_coherence": 7,
+  "story_coherence_notes": "Strong narrative but missing key moment",
+  "swap_recommendations": [
+    {
+      "position": 6,
+      "reason": "Too similar to position 4",
+      "look_for": "A different moment from this part of the story"
+    }
+  ],
+  "batch_summary": "Running summary of this batch for carry-forward"
+}]]
+
+
+-- == Swap Resolution prompt (Pass 6 — vision) =================================
+M.SWAP_RESOLUTION_PROMPT_TEMPLATE = [[SWAP EVALUATION
+
+Story context: "%%STORY_PROMPT%%"
+Beat %%BEAT_NUM%%: "%%BEAT_DESCRIPTION%%"
+
+The reviewer flagged this photo for replacement:
+Reason: "%%SWAP_REASON%%"
+Suggestion: "%%LOOK_FOR%%"
+
+Photo 1 is the CURRENT selection.
+Photos 2-%%NUM_REPLACEMENTS%% are REPLACEMENT CANDIDATES.
+
+Should the current photo be replaced? If so, which replacement is best?
+
+Return ONLY valid JSON:
+{
+  "action": "swap",
+  "replacement": 3,
+  "reasoning": "Photo 3 better serves the beat because..."
+}
+
+action: "keep" if the current photo is actually the best option, "swap" if replacing.
+If action is "keep", omit "replacement".]]
 
 
 -- == Base64 encoder ===========================================================
@@ -571,14 +908,8 @@ function M.normalizeScores(data)
     }
     if not validCat[catVal] then catVal = "other" end
 
-    -- Validate narrative_role against allowed values
-    local roleVal = tostring(data.narrative_role or "detail"):lower()
-    local validRole = {
-        scene_setter = true, character_moment = true, action = true,
-        detail = true, transition = true, closing = true,
-        establishing = true, emotional_peak = true,
-    }
-    if not validRole[roleVal] then roleVal = "detail" end
+    -- narrative_role is NOT assigned during scoring (Pass 1).
+    -- It will be assigned during story assembly (Pass 2) with full context.
 
     return {
         technical      = math.max(1, math.min(10, tonumber(data.technical) or 5)),
@@ -587,7 +918,6 @@ function M.normalizeScores(data)
         moment         = math.max(1, math.min(10, tonumber(data.moment) or 5)),
         content        = tostring(data.content or "unknown"),
         category       = catVal,
-        narrative_role = roleVal,
         eye_quality    = eyeVal,
         reject         = (data.reject == true or data.reject == "true"),
     }
@@ -869,6 +1199,12 @@ function M.queryClaudeBatch(images, imageLabels, anchorImages, anchorLabels,
         return nil, "Claude API error: " .. (decoded.error.message or "Unknown")
     end
 
+    -- Extract usage for cost tracking
+    if decoded.usage then
+        recordUsage("claude", claudeModel,
+            decoded.usage.input_tokens, decoded.usage.output_tokens)
+    end
+
     if decoded.content and type(decoded.content) == "table" then
         for _, block in ipairs(decoded.content) do
             if block.type == "text" and block.text then
@@ -976,6 +1312,12 @@ function M.queryOpenAIBatch(images, imageLabels, anchorImages, anchorLabels,
         return nil, "OpenAI API error: " .. (decoded.error.message or "Unknown")
     end
 
+    -- Extract usage for cost tracking
+    if decoded.usage then
+        recordUsage("openai", openaiModel,
+            decoded.usage.prompt_tokens, decoded.usage.completion_tokens)
+    end
+
     if decoded.choices and decoded.choices[1] and decoded.choices[1].message then
         return decoded.choices[1].message.content, nil
     end
@@ -1073,6 +1415,14 @@ function M.queryGeminiBatch(images, imageLabels, anchorImages, anchorLabels,
 
     if decoded.error then
         return nil, "Gemini API error: " .. (decoded.error.message or "Unknown")
+    end
+
+    -- Extract usage for cost tracking
+    -- Gemini returns usageMetadata.promptTokenCount and .candidatesTokenCount
+    if decoded.usageMetadata then
+        recordUsage("gemini", geminiModel,
+            decoded.usageMetadata.promptTokenCount,
+            decoded.usageMetadata.candidatesTokenCount)
     end
 
     if decoded.candidates and decoded.candidates[1]
@@ -1206,6 +1556,12 @@ function M.queryClaudeText(prompt, claudeModel, apiKey, timeoutSecs, maxTokens)
         return nil, "Claude API error: " .. (decoded.error.message or "Unknown")
     end
 
+    -- Extract usage for cost tracking
+    if decoded.usage then
+        recordUsage("claude", claudeModel,
+            decoded.usage.input_tokens, decoded.usage.output_tokens)
+    end
+
     if decoded.content and type(decoded.content) == "table" then
         for _, block in ipairs(decoded.content) do
             if block.type == "text" and block.text then
@@ -1256,6 +1612,12 @@ function M.queryOpenAIText(prompt, openaiModel, apiKey, timeoutSecs, maxTokens)
 
     if decoded.error then
         return nil, "OpenAI API error: " .. (decoded.error.message or "Unknown")
+    end
+
+    -- Extract usage for cost tracking
+    if decoded.usage then
+        recordUsage("openai", openaiModel,
+            decoded.usage.prompt_tokens, decoded.usage.completion_tokens)
     end
 
     if decoded.choices and decoded.choices[1] and decoded.choices[1].message then
@@ -1311,6 +1673,13 @@ function M.queryGeminiText(prompt, geminiModel, apiKey, timeoutSecs, maxTokens)
         return nil, "Gemini API error: " .. (decoded.error.message or "Unknown")
     end
 
+    -- Extract usage for cost tracking
+    if decoded.usageMetadata then
+        recordUsage("gemini", geminiModel,
+            decoded.usageMetadata.promptTokenCount,
+            decoded.usageMetadata.candidatesTokenCount)
+    end
+
     if decoded.candidates and decoded.candidates[1]
        and decoded.candidates[1].content
        and decoded.candidates[1].content.parts then
@@ -1345,83 +1714,6 @@ function M.queryText(prompt, prefs, maxTokens)
     else
         return nil, "Unknown provider: " .. tostring(provider)
     end
-end
-
--- == Pass 2: focused image comparison =========================================
--- Sends 2-3 images for a specific story beat and asks which is best.
--- @param images     Array of {base64, fileSize} (primary + alternates)
--- @param imageIds   Array of string IDs matching images
--- @param beat       String: the story beat description
--- @param role       String: the narrative role
--- @param note       String: the editorial note
--- @param prefs      Preferences table
--- @return (selectedId, nil) or (nil, errorMsg)
-function M.queryPass2(images, imageIds, beat, role, note, prefs)
-    local prompt = M.PASS2_PROMPT_TEMPLATE
-    prompt = prompt:gsub("%%BEAT%%", beat or "")
-    prompt = prompt:gsub("%%ROLE%%", role or "")
-    prompt = prompt:gsub("%%NOTE%%", note or "")
-    prompt = prompt:gsub("%%NUM_PHOTOS%%", tostring(#images))
-
-    local imageLabels = {}
-    for i, id in ipairs(imageIds) do
-        if i == 1 then
-            imageLabels[i] = string.format("[Photo %d - Current Selection] ID: %s", i, id)
-        else
-            imageLabels[i] = string.format("[Photo %d - Alternate] ID: %s", i, id)
-        end
-    end
-
-    local provider = prefs.provider
-    local timeout  = prefs.timeoutSecs or BatchStrategy.getDefaultTimeout(provider)
-    local maxTokens = 256  -- small response needed
-
-    local rawText, err
-
-    if provider == "claude" then
-        rawText, err = M.queryClaudeBatch(images, imageLabels, nil, nil,
-            prompt, prefs.claudeModel, prefs.claudeApiKey, maxTokens, timeout)
-    elseif provider == "openai" then
-        rawText, err = M.queryOpenAIBatch(images, imageLabels, nil, nil,
-            prompt, prefs.openaiModel, prefs.openaiApiKey, maxTokens, timeout)
-    elseif provider == "gemini" then
-        rawText, err = M.queryGeminiBatch(images, imageLabels, nil, nil,
-            prompt, prefs.geminiModel, prefs.geminiApiKey, maxTokens, timeout)
-    else
-        return nil, "Pass 2 not supported for provider: " .. tostring(provider)
-    end
-
-    if not rawText then return nil, err end
-
-    -- Parse response: {"selected_id": "...", "reason": "..."}
-    local ok, data = pcall(json.decode, rawText)
-    if not ok or type(data) ~= "table" then
-        -- Try extracting from markdown block
-        local block = rawText:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or rawText:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-    if not ok or type(data) ~= "table" then
-        -- Try finding JSON object
-        local objStr = rawText:match("%{.-%}")
-        if objStr then
-            ok, data = pcall(json.decode, objStr)
-        end
-    end
-
-    if ok and data and data.selected_id then
-        -- Validate the selected ID is one of the candidates
-        for _, id in ipairs(imageIds) do
-            if tostring(data.selected_id) == id then
-                return id, nil
-            end
-        end
-        return nil, "Pass 2 returned invalid ID: " .. tostring(data.selected_id)
-    end
-
-    return nil, "Could not parse Pass 2 response: " .. rawText:sub(1, 200)
 end
 
 -- == Parse story/synthesis response ===========================================
@@ -1521,10 +1813,679 @@ function M.parseStoryResponse(raw, validIds)
     return result, nil
 end
 
+-- == v3 Story prepopulation builder ============================================
+-- Builds a prepopulation prompt from snapshots + metadata, makes a text-only
+-- AI call, returns a natural language summary for the user to edit.
+-- @param snapshots   Array of snapshot tables from Pass 1
+-- @param photoStore  Table of photoStore entries (indexed by localIdentifier)
+-- @param preHints    String: user's pre-hints from run dialog
+-- @param prefs       Settings table for AI call
+-- @return (summary, nil) or (nil, errorMsg)
+function M.buildPrepopulationSummary(snapshots, photoStore, preHints, prefs)
+    -- Build snapshot summaries
+    local snapshotParts = {}
+    if snapshots and #snapshots > 0 then
+        for _, snap in ipairs(snapshots) do
+            local line = string.format("Batch %d", snap.batchIndex or 0)
+            if snap.timeRange then
+                local tr = snap.timeRange
+                if tr.start then line = line .. " (" .. tr.start end
+                if tr.finish then line = line .. " to " .. tr.finish .. ")" end
+            end
+            line = line .. ": "
+            local details = {}
+            if snap.scene and snap.scene ~= "" then details[#details + 1] = "Scene: " .. snap.scene end
+            if snap.people and type(snap.people) == "table" and #snap.people > 0 then
+                details[#details + 1] = "People: " .. table.concat(snap.people, ", ")
+            end
+            if snap.mood and snap.mood ~= "" then details[#details + 1] = "Mood: " .. snap.mood end
+            if snap.setting and snap.setting ~= "" then details[#details + 1] = "Setting: " .. snap.setting end
+            if snap.action and snap.action ~= "" then details[#details + 1] = "Action: " .. snap.action end
+            line = line .. table.concat(details, ". ")
+            snapshotParts[#snapshotParts + 1] = line
+        end
+    else
+        snapshotParts[#snapshotParts + 1] = "(No visual snapshots available)"
+    end
+
+    -- Build category counts and people counts from photoStore
+    local categoryCounts = {}
+    local peopleCounts = {}
+    local totalPhotos = 0
+    local minTime, maxTime
+
+    for _, store in pairs(photoStore) do
+        totalPhotos = totalPhotos + 1
+        categoryCounts[store.category] = (categoryCounts[store.category] or 0) + 1
+        if store.people then
+            for _, name in ipairs(store.people) do
+                peopleCounts[name] = (peopleCounts[name] or 0) + 1
+            end
+        end
+        if store.captureTime then
+            if not minTime or store.captureTime < minTime then minTime = store.captureTime end
+            if not maxTime or store.captureTime > maxTime then maxTime = store.captureTime end
+        end
+    end
+
+    -- Format category summary
+    local catParts = {}
+    for cat, count in pairs(categoryCounts) do
+        catParts[#catParts + 1] = string.format("%s: %d", cat, count)
+    end
+    local categorySummary = #catParts > 0 and table.concat(catParts, ", ") or "Unknown"
+
+    -- Format people summary
+    local peopleParts = {}
+    for name, count in pairs(peopleCounts) do
+        peopleParts[#peopleParts + 1] = string.format("%s (%d photos)", name, count)
+    end
+    local peopleSummary = #peopleParts > 0 and table.concat(peopleParts, ", ") or "No named people detected"
+
+    -- Format time range
+    local timeRange = "Unknown"
+    if minTime and maxTime then
+        local minStr = LrDate.timeToUserFormat(minTime, "%Y-%m-%d %H:%M")
+        local maxStr = LrDate.timeToUserFormat(maxTime, "%Y-%m-%d %H:%M")
+        if minStr == maxStr then
+            timeRange = minStr
+        else
+            timeRange = minStr .. " to " .. maxStr
+        end
+    end
+
+    -- Build the prompt
+    local prompt = M.PREPOPULATE_PROMPT_TEMPLATE
+    prompt = prompt:gsub("%%%%SNAPSHOT_SUMMARIES%%%%", function() return table.concat(snapshotParts, "\n") end)
+    prompt = prompt:gsub("%%%%PEOPLE_SUMMARY%%%%", function() return peopleSummary end)
+    prompt = prompt:gsub("%%%%CATEGORY_SUMMARY%%%%", function() return categorySummary end)
+    prompt = prompt:gsub("%%%%TIME_RANGE%%%%", function() return timeRange end)
+    prompt = prompt:gsub("%%%%TOTAL_PHOTOS%%%%", function() return tostring(totalPhotos) end)
+
+    local hintsText = ""
+    if preHints and preHints ~= "" then
+        hintsText = "Photographer's notes: " .. preHints
+    end
+    prompt = prompt:gsub("%%%%PRE_HINTS%%%%", function() return hintsText end)
+
+    -- Make the text-only AI call
+    local maxTokens = 512  -- short response
+    local response, err = M.queryText(prompt, prefs, maxTokens)
+    if not response then
+        return nil, err
+    end
+
+    -- Clean up response — remove any quotes, markdown, etc.
+    response = response:gsub("^%s+", ""):gsub("%s+$", "")
+    response = response:gsub('^"', ""):gsub('"$', "")
+
+    return response, nil
+end
+
+-- Fallback prepopulation when AI call fails.
+-- Returns a template-based summary from available data.
+function M.buildPrepopulationFallback(snapshots, photoStore, preHints)
+    local totalPhotos = 0
+    local categoryCounts = {}
+    local peopleCounts = {}
+    local minTime, maxTime
+
+    for _, store in pairs(photoStore) do
+        totalPhotos = totalPhotos + 1
+        categoryCounts[store.category] = (categoryCounts[store.category] or 0) + 1
+        if store.people then
+            for _, name in ipairs(store.people) do
+                peopleCounts[name] = (peopleCounts[name] or 0) + 1
+            end
+        end
+        if store.captureTime then
+            if not minTime or store.captureTime < minTime then minTime = store.captureTime end
+            if not maxTime or store.captureTime > maxTime then maxTime = store.captureTime end
+        end
+    end
+
+    local parts = {}
+    parts[#parts + 1] = string.format("%d photos", totalPhotos)
+
+    if minTime and maxTime then
+        local minStr = LrDate.timeToUserFormat(minTime, "%Y-%m-%d %H:%M")
+        local maxStr = LrDate.timeToUserFormat(maxTime, "%Y-%m-%d %H:%M")
+        parts[#parts + 1] = string.format("from %s to %s", minStr, maxStr)
+    end
+
+    local nameList = {}
+    for name, _ in pairs(peopleCounts) do nameList[#nameList + 1] = name end
+    if #nameList > 0 then
+        parts[#parts + 1] = string.format("%d people identified: %s", #nameList, table.concat(nameList, ", "))
+    end
+
+    local catParts = {}
+    for cat, count in pairs(categoryCounts) do
+        catParts[#catParts + 1] = string.format("%s (%d)", cat, count)
+    end
+    if #catParts > 0 then
+        parts[#parts + 1] = "Categories: " .. table.concat(catParts, ", ")
+    end
+
+    -- Add snapshot scenes
+    if snapshots and #snapshots > 0 then
+        local scenes = {}
+        for _, snap in ipairs(snapshots) do
+            if snap.scene and snap.scene ~= "" then
+                scenes[#scenes + 1] = snap.scene
+            end
+        end
+        if #scenes > 0 then
+            parts[#parts + 1] = "Key scenes: " .. table.concat(scenes, "; "):sub(1, 200)
+        end
+    end
+
+    return table.concat(parts, ". ") .. "."
+end
+
+-- == v3 Story assembly: build metadata rollup =================================
+-- Aggregates scored photo data into a rollup for the story assembly prompt.
+-- @param photoStore  Table indexed by localIdentifier
+-- @return rollup table
+function M.buildMetadataRollup(photoStore)
+    local totalPhotos = 0
+    local categoryCounts = {}
+    local peopleCounts = {}
+    local soloCount = {}
+    local composites = {}
+    local minTime, maxTime
+
+    for _, store in pairs(photoStore) do repeat
+        if store.reject then break end
+        totalPhotos = totalPhotos + 1
+        categoryCounts[store.category] = (categoryCounts[store.category] or 0) + 1
+        composites[#composites + 1] = store.composite
+
+        local personCount = 0
+        if store.people then
+            for _, name in ipairs(store.people) do
+                peopleCounts[name] = (peopleCounts[name] or 0) + 1
+                personCount = personCount + 1
+            end
+            -- Track solo shots (exactly 1 person)
+            if personCount == 1 then
+                local soloName = store.people[1]
+                soloCount[soloName] = (soloCount[soloName] or 0) + 1
+            end
+        end
+
+        if store.captureTime then
+            if not minTime or store.captureTime < minTime then minTime = store.captureTime end
+            if not maxTime or store.captureTime > maxTime then maxTime = store.captureTime end
+        end
+    until true end
+
+    -- Score distribution stats
+    table.sort(composites)
+    local compositeMin = composites[1] or 0
+    local compositeMax = composites[#composites] or 0
+    local compositeMean = 0
+    for _, c in ipairs(composites) do compositeMean = compositeMean + c end
+    if #composites > 0 then compositeMean = compositeMean / #composites end
+
+    local topQuartileIdx = math.max(1, math.floor(#composites * 0.75))
+    local topQuartileThreshold = composites[topQuartileIdx] or 0
+
+    -- Group shots count
+    local groupShots = 0
+    for _, store in pairs(photoStore) do
+        if store.people and #store.people >= 3 then
+            groupShots = groupShots + 1
+        end
+    end
+
+    -- Build people table
+    local people = {}
+    for name, count in pairs(peopleCounts) do
+        people[name] = {
+            count = count,
+            soloCount = soloCount[name] or 0,
+        }
+    end
+
+    -- Time range
+    local timeRange = ""
+    if minTime and maxTime then
+        timeRange = LrDate.timeToUserFormat(minTime, "%Y-%m-%d %H:%M") .. " to " ..
+                    LrDate.timeToUserFormat(maxTime, "%Y-%m-%d %H:%M")
+    end
+
+    return {
+        totalPhotos = totalPhotos,
+        categoryBreakdown = categoryCounts,
+        scoreDistribution = {
+            compositeRange = { compositeMin, compositeMax },
+            compositeMean = math.floor(compositeMean * 10 + 0.5) / 10,
+            topQuartileThreshold = math.floor(topQuartileThreshold * 10 + 0.5) / 10,
+        },
+        people = people,
+        groupShots = groupShots,
+        timeRange = timeRange,
+    }
+end
+
+-- == v3 Story assembly prompt builder ==========================================
+-- Builds the complete Pass 2 prompt from user story + rollup + snapshots + photos.
+-- @param userStoryPrompt  String: confirmed user story description
+-- @param emphasis         String: optional emphasis ("the dive was the highlight")
+-- @param eventTimeline    String: merged snapshot text (event blocks)
+-- @param rollup           Table: from buildMetadataRollup
+-- @param allPhotosText    String: formatted text of all photo metadata
+-- @param targetCount      Number: number of beats to plan
+-- @return string: the complete prompt
+function M.buildStoryAssemblyPrompt(userStoryPrompt, emphasis, eventTimeline, rollup, allPhotosText, targetCount)
+    local prompt = M.STORY_ASSEMBLY_PROMPT_TEMPLATE
+
+    local emphasisText = ""
+    if emphasis and emphasis ~= "" then
+        emphasisText = "## Emphasis\nThe photographer specifically asked to emphasize: " .. emphasis
+    end
+
+    local rollupJson = json.encode(rollup)
+
+    prompt = prompt:gsub("%%%%USER_STORY_PROMPT%%%%", function() return userStoryPrompt end)
+    prompt = prompt:gsub("%%%%EMPHASIS%%%%", function() return emphasisText end)
+    prompt = prompt:gsub("%%%%EVENT_TIMELINE%%%%", function() return eventTimeline end)
+    prompt = prompt:gsub("%%%%METADATA_ROLLUP%%%%", function() return rollupJson end)
+    prompt = prompt:gsub("%%%%ALL_PHOTOS%%%%", function() return allPhotosText end)
+    prompt = prompt:gsub("%%%%TARGET_COUNT%%%%", function() return tostring(targetCount) end)
+
+    return prompt
+end
+
+-- == v3 Beat list parser ======================================================
+-- Parses the story assembly response into a structured beat list.
+-- @param raw  String: raw AI response
+-- @return (beatList, nil) or (nil, errorMsg)
+function M.parseBeatListResponse(raw)
+    if not raw or raw == "" then
+        return nil, "Empty response from model"
+    end
+
+    local ok, data
+
+    -- Level 1: Direct JSON parse
+    ok, data = pcall(json.decode, raw)
+
+    -- Level 2: Extract from markdown code block
+    if not (ok and type(data) == "table") then
+        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
+                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
+        if block then
+            ok, data = pcall(json.decode, block)
+        end
+    end
+
+    -- Level 3: Find JSON object in surrounding text
+    if not (ok and type(data) == "table") then
+        local objStart = raw:find("{")
+        local objEnd = raw:reverse():find("}")
+        if objStart and objEnd then
+            objEnd = #raw - objEnd + 1
+            local objStr = raw:sub(objStart, objEnd)
+            ok, data = pcall(json.decode, objStr)
+        end
+    end
+
+    if not ok or type(data) ~= "table" then
+        return nil, "Could not parse beat list response as JSON: " .. raw:sub(1, 300)
+    end
+
+    -- Extract beats array
+    local beatsRaw = data.beats
+    if not beatsRaw or type(beatsRaw) ~= "table" or #beatsRaw == 0 then
+        return nil, "No beats array in story assembly response: " .. raw:sub(1, 300)
+    end
+
+    -- Normalize beats
+    local beats = {}
+    for _, b in ipairs(beatsRaw) do
+        local searchCriteria = b.search_criteria or {}
+        beats[#beats + 1] = {
+            position       = tonumber(b.position) or (#beats + 1),
+            beat           = tostring(b.beat or ""),
+            description    = tostring(b.description or ""),
+            narrativeRole  = tostring(b.narrative_role or "detail"),
+            searchCriteria = {
+                mustHave     = searchCriteria.must_have or {},
+                prefer       = searchCriteria.prefer or {},
+                avoid        = searchCriteria.avoid or {},
+                categoryHint = searchCriteria.category_hint or {},
+                timeRange    = tostring(searchCriteria.time_range or "any"),
+                minComposite = tonumber(searchCriteria.min_composite) or 5.0,
+            },
+        }
+    end
+
+    -- Sort by position
+    table.sort(beats, function(a, b) return a.position < b.position end)
+
+    -- Re-number positions sequentially
+    for i, beat in ipairs(beats) do
+        beat.position = i
+    end
+
+    return {
+        storyTitle      = data.story_title or "Untitled Story",
+        beats           = beats,
+        categoryTargets = data.category_targets or {},
+        peopleTargets   = data.people_targets or {},
+    }, nil
+end
+
+-- == v3 Candidate ranking prompt builder ======================================
+-- Builds the text-only ranking prompt for Pass 3B.
+-- @param beatNum          Number: current beat position
+-- @param totalBeats       Number: total beats in story
+-- @param beatDescription  String: beat description
+-- @param narrativeRole    String: beat narrative role
+-- @param searchCriteria   Table: beat search criteria
+-- @param candidates       Array of {num, content, composite, category, people, time}
+-- @return string: the prompt
+function M.buildCandidateRankingPrompt(beatNum, totalBeats, beatDescription, narrativeRole, searchCriteria, candidates)
+    local prompt = M.CANDIDATE_RANKING_PROMPT_TEMPLATE
+
+    -- Format search criteria as readable text
+    local criteriaParts = {}
+    if searchCriteria.mustHave and #searchCriteria.mustHave > 0 then
+        criteriaParts[#criteriaParts + 1] = "Must have: " .. table.concat(searchCriteria.mustHave, ", ")
+    end
+    if searchCriteria.prefer and #searchCriteria.prefer > 0 then
+        criteriaParts[#criteriaParts + 1] = "Prefer: " .. table.concat(searchCriteria.prefer, ", ")
+    end
+    if searchCriteria.avoid and #searchCriteria.avoid > 0 then
+        criteriaParts[#criteriaParts + 1] = "Avoid: " .. table.concat(searchCriteria.avoid, ", ")
+    end
+    local criteriaText = table.concat(criteriaParts, ". ")
+
+    -- Format candidate list
+    local candidateLines = {}
+    for _, c in ipairs(candidates) do
+        local peopleTxt = ""
+        if c.people and #c.people > 0 then
+            peopleTxt = ", people=[" .. table.concat(c.people, ",") .. "]"
+        end
+        candidateLines[#candidateLines + 1] = string.format(
+            '%d. (composite=%.1f, category=%s%s, time=%s)\n   "%s"',
+            c.num, c.composite or 0, c.category or "other", peopleTxt,
+            c.time or "unknown", c.content or "unknown"
+        )
+    end
+
+    prompt = prompt:gsub("%%%%BEAT_NUM%%%%", function() return tostring(beatNum) end)
+    prompt = prompt:gsub("%%%%TOTAL_BEATS%%%%", function() return tostring(totalBeats) end)
+    prompt = prompt:gsub("%%%%BEAT_DESCRIPTION%%%%", function() return beatDescription end)
+    prompt = prompt:gsub("%%%%NARRATIVE_ROLE%%%%", function() return narrativeRole end)
+    prompt = prompt:gsub("%%%%SEARCH_CRITERIA%%%%", function() return criteriaText end)
+    prompt = prompt:gsub("%%%%NUM_CANDIDATES%%%%", function() return tostring(#candidates) end)
+    prompt = prompt:gsub("%%%%CANDIDATE_LIST%%%%", function() return table.concat(candidateLines, "\n") end)
+
+    return prompt
+end
+
+-- == v3 Parse candidate ranking response ======================================
+function M.parseCandidateRankingResponse(raw)
+    if not raw or raw == "" then
+        return nil, "Empty response"
+    end
+
+    local ok, data = pcall(json.decode, raw)
+    if not (ok and type(data) == "table") then
+        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
+                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
+        if block then
+            ok, data = pcall(json.decode, block)
+        end
+    end
+    if not (ok and type(data) == "table") then
+        local objStr = raw:match("%{.-%}")
+        if objStr then
+            ok, data = pcall(json.decode, objStr)
+        end
+    end
+
+    if ok and data and data.ranked and type(data.ranked) == "table" then
+        -- Validate all entries are numbers
+        local ranked = {}
+        for _, v in ipairs(data.ranked) do
+            local n = tonumber(v)
+            if n then ranked[#ranked + 1] = n end
+        end
+        return ranked, nil
+    end
+
+    return nil, "Could not parse candidate ranking: " .. (raw or ""):sub(1, 200)
+end
+
+-- == v3 Build beat casting prompt (Pass 4) ====================================
+-- Builds a vision prompt for selecting the best candidate image for a beat.
+-- @param storyPrompt     User's confirmed story description
+-- @param beatNum         Position number of this beat
+-- @param totalBeats      Total number of beats in the story
+-- @param beatDescription Description of what this beat should capture
+-- @param narrativeRole   The narrative role (establishing, scene_setter, etc.)
+-- @param searchCriteria  Table with mustHave, prefer, avoid arrays
+-- @param numCandidates   Number of candidate images being sent
+-- @param previousSelections Array of {content=..., beat=...} for prior picks
+-- @return prompt string
+function M.buildBeatCastingPrompt(storyPrompt, beatNum, totalBeats, beatDescription,
+                                   narrativeRole, searchCriteria, numCandidates, previousSelections)
+    local prompt = M.BEAT_CASTING_PROMPT_TEMPLATE
+
+    -- Format search criteria fields
+    local mustHave = "none specified"
+    local prefer   = "none specified"
+    local avoid    = "none specified"
+    if searchCriteria then
+        if searchCriteria.mustHave and #searchCriteria.mustHave > 0 then
+            mustHave = table.concat(searchCriteria.mustHave, ", ")
+        end
+        if searchCriteria.prefer and #searchCriteria.prefer > 0 then
+            prefer = table.concat(searchCriteria.prefer, ", ")
+        end
+        if searchCriteria.avoid and #searchCriteria.avoid > 0 then
+            avoid = table.concat(searchCriteria.avoid, ", ")
+        end
+    end
+
+    -- Format previous selections context
+    local prevText = ""
+    if previousSelections and #previousSelections > 0 then
+        local lines = { "PREVIOUS SELECTIONS (for context — avoid redundancy):" }
+        for _, sel in ipairs(previousSelections) do
+            lines[#lines + 1] = string.format('  Beat %d: "%s"',
+                sel.position or 0, (sel.content or ""):sub(1, 80))
+        end
+        prevText = table.concat(lines, "\n")
+    else
+        prevText = "This is the first beat — no previous selections yet."
+    end
+
+    prompt = prompt:gsub("%%%%STORY_PROMPT%%%%", function() return storyPrompt end)
+    prompt = prompt:gsub("%%%%BEAT_NUM%%%%", function() return tostring(beatNum) end)
+    prompt = prompt:gsub("%%%%TOTAL_BEATS%%%%", function() return tostring(totalBeats) end)
+    prompt = prompt:gsub("%%%%BEAT_DESCRIPTION%%%%", function() return beatDescription end)
+    prompt = prompt:gsub("%%%%NARRATIVE_ROLE%%%%", function() return narrativeRole or "general" end)
+    prompt = prompt:gsub("%%%%MUST_HAVE%%%%", function() return mustHave end)
+    prompt = prompt:gsub("%%%%PREFER%%%%", function() return prefer end)
+    prompt = prompt:gsub("%%%%AVOID%%%%", function() return avoid end)
+    prompt = prompt:gsub("%%%%PREVIOUS_SELECTIONS%%%%", function() return prevText end)
+    prompt = prompt:gsub("%%%%NUM_CANDIDATES%%%%", function() return tostring(numCandidates) end)
+
+    return prompt
+end
+
+-- == v3 Parse beat casting response ===========================================
+-- Parses the vision model's response to a beat casting call.
+-- @return table {primary, backup, reasoning, flag} or nil, error
+function M.parseBeatCastingResponse(raw)
+    if not raw or raw == "" then
+        return nil, "Empty response"
+    end
+
+    local ok, data = pcall(json.decode, raw)
+    if not (ok and type(data) == "table") then
+        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
+                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
+        if block then
+            ok, data = pcall(json.decode, block)
+        end
+    end
+    if not (ok and type(data) == "table") then
+        local objStr = raw:match("%{[\1-\127\128-\255]-primary[\1-\127\128-\255]-%}")
+        if objStr then
+            ok, data = pcall(json.decode, objStr)
+        end
+    end
+
+    if ok and data and data.primary then
+        return {
+            primary   = tonumber(data.primary),
+            backup    = tonumber(data.backup),
+            reasoning = data.reasoning or "",
+            flag      = data.flag,     -- nil, "duplicate_risk", or "weak_match"
+        }, nil
+    end
+
+    return nil, "Could not parse beat casting: " .. (raw or ""):sub(1, 200)
+end
+
+-- == v3 Build story review prompt (Pass 5) ====================================
+function M.buildStoryReviewPrompt(storyPrompt, beats, beatRange, batchContext)
+    local prompt = M.STORY_REVIEW_PROMPT_TEMPLATE
+
+    -- Format beat list
+    local beatLines = {}
+    for _, beat in ipairs(beats) do
+        beatLines[#beatLines + 1] = string.format('%d. %s — role: %s',
+            beat.position or 0, beat.beat or beat.description or "beat",
+            beat.narrativeRole or "general")
+    end
+    local beatListText = table.concat(beatLines, "\n")
+
+    -- Batch context (for multi-batch reviews)
+    local contextText = ""
+    if batchContext and batchContext ~= "" then
+        contextText = "Previous batch summary:\n" .. batchContext
+    end
+
+    prompt = prompt:gsub("%%%%STORY_PROMPT%%%%", function() return storyPrompt end)
+    prompt = prompt:gsub("%%%%BEAT_LIST%%%%", function() return beatListText end)
+    prompt = prompt:gsub("%%%%BEAT_RANGE%%%%", function() return beatRange or "all" end)
+    prompt = prompt:gsub("%%%%BATCH_CONTEXT%%%%", function() return contextText end)
+
+    return prompt
+end
+
+-- == v3 Parse story review response ===========================================
+function M.parseStoryReviewResponse(raw)
+    if not raw or raw == "" then
+        return nil, "Empty response"
+    end
+
+    local ok, data = pcall(json.decode, raw)
+    if not (ok and type(data) == "table") then
+        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
+                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
+        if block then
+            ok, data = pcall(json.decode, block)
+        end
+    end
+    if not (ok and type(data) == "table") then
+        -- Try to find a JSON object containing story_coherence
+        local objStr = raw:match("%{[\1-\127\128-\255]-story_coherence[\1-\127\128-\255]-%}")
+        if objStr then
+            ok, data = pcall(json.decode, objStr)
+        end
+    end
+
+    if ok and data then
+        return {
+            photoAssessments   = data.photo_assessments or {},
+            duplicates         = data.duplicates or {},
+            gaps               = data.gaps or {},
+            pacingIssues       = data.pacing_issues or {},
+            storyCoherence     = tonumber(data.story_coherence) or 5,
+            coherenceNotes     = data.story_coherence_notes or "",
+            swapRecommendations = data.swap_recommendations or {},
+            batchSummary       = data.batch_summary or "",
+        }, nil
+    end
+
+    return nil, "Could not parse story review: " .. (raw or ""):sub(1, 200)
+end
+
+-- == v3 Build swap resolution prompt (Pass 6) =================================
+function M.buildSwapResolutionPrompt(storyPrompt, beatNum, beatDescription,
+                                      swapReason, lookFor, numReplacements)
+    local prompt = M.SWAP_RESOLUTION_PROMPT_TEMPLATE
+
+    prompt = prompt:gsub("%%%%STORY_PROMPT%%%%", function() return storyPrompt end)
+    prompt = prompt:gsub("%%%%BEAT_NUM%%%%", function() return tostring(beatNum) end)
+    prompt = prompt:gsub("%%%%BEAT_DESCRIPTION%%%%", function() return beatDescription end)
+    prompt = prompt:gsub("%%%%SWAP_REASON%%%%", function() return swapReason or "" end)
+    prompt = prompt:gsub("%%%%LOOK_FOR%%%%", function() return lookFor or "" end)
+    prompt = prompt:gsub("%%%%NUM_REPLACEMENTS%%%%", function() return tostring(numReplacements + 1) end)  -- +1 for current
+
+    return prompt
+end
+
+-- == v3 Parse swap resolution response ========================================
+function M.parseSwapResolutionResponse(raw)
+    if not raw or raw == "" then
+        return nil, "Empty response"
+    end
+
+    local ok, data = pcall(json.decode, raw)
+    if not (ok and type(data) == "table") then
+        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
+                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
+        if block then
+            ok, data = pcall(json.decode, block)
+        end
+    end
+    if not (ok and type(data) == "table") then
+        local objStr = raw:match("%{[\1-\127\128-\255]-action[\1-\127\128-\255]-%}")
+        if objStr then
+            ok, data = pcall(json.decode, objStr)
+        end
+    end
+
+    if ok and data and data.action then
+        return {
+            action      = data.action,       -- "keep" or "swap"
+            replacement = tonumber(data.replacement),
+            reasoning   = data.reasoning or "",
+        }, nil
+    end
+
+    return nil, "Could not parse swap resolution: " .. (raw or ""):sub(1, 200)
+end
+
+-- == v3 Unified vision query (images + prompt, no anchors) ====================
+-- Simplified wrapper around queryBatch for Passes 4, 5, 6.
+-- @param images  Array of {base64, fileSize} for candidate photos
+-- @param labels  Array of label strings (e.g., "[Photo 1]", "[Photo 2]")
+-- @param prompt  The prompt text
+-- @param prefs   Preferences table (provider, model, apiKey, etc.)
+-- @param maxTokens Max output tokens (default 1024)
+-- @return (rawText, nil) or (nil, errorMsg)
+function M.queryVision(images, labels, prompt, prefs, maxTokens)
+    return M.queryBatch(images, labels, nil, nil, prompt, prefs, maxTokens or 1024)
+end
+
+
 -- == Perceptual hashing (dHash) via sips ======================================
 -- Computes a 64-bit difference hash for visual duplicate detection.
 -- Uses macOS built-in `sips` to resize to 9x8 BMP, then parses the BMP
 -- pixel data in pure Lua. No external dependencies.
+-- Handles both 24-bit (RGB) and 32-bit (RGBA) BMPs — modern macOS sips
+-- often produces 32-bit BMPs even for opaque images.
 
 local function parseBmpGrayscale(path)
     local data = M.readBinaryFile(path)
@@ -1544,16 +2505,24 @@ local function parseBmpGrayscale(path)
     local height      = u32(23)
     local bpp         = u16(29)
 
-    if bpp ~= 24 then return nil end
+    -- Support both 24-bit (RGB) and 32-bit (RGBA) BMPs
+    local bytesPerPixel
+    if bpp == 24 then
+        bytesPerPixel = 3
+    elseif bpp == 32 then
+        bytesPerPixel = 4
+    else
+        return nil
+    end
 
-    local rowBytes = math.ceil(width * 3 / 4) * 4
+    local rowBytes = math.ceil(width * bytesPerPixel / 4) * 4
 
     local rows = {}
     for y = 0, height - 1 do
         local row = {}
         local rowStart = pixelOffset + (height - 1 - y) * rowBytes
         for x = 0, width - 1 do
-            local pixStart = rowStart + x * 3 + 1
+            local pixStart = rowStart + x * bytesPerPixel + 1
             if pixStart + 2 > #data then return nil end
             local b, g, r = data:byte(pixStart, pixStart + 2)
             row[x + 1] = math.floor(0.299 * r + 0.587 * g + 0.114 * b + 0.5)

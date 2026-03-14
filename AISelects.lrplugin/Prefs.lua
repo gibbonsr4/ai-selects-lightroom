@@ -34,7 +34,11 @@ local DEFAULTS = {
     -- Story mode
     storyPreset            = "family_vacation",
     storyCustomInstructions = "",
-    enablePass2        = false,         -- Pass 2 refinement for story mode
+    -- Pre-scoring context (all modes)
+    preHints           = "",             -- e.g. "this is from 2007", "the older man is my dad"
+    -- Story prompt (confirmed by user after Pass 1)
+    storyPrompt        = "",             -- user's confirmed story description
+    storyEmphasis      = "",             -- optional emphasis ("the dive was the highlight")
     -- Logging
     enableLogging      = false,
     logFolder          = "",
@@ -84,7 +88,9 @@ local function getPrefs()
         batchSize          = numPref(prefs, "batchSize"),
         storyPreset            = stringPref(prefs, "storyPreset"),
         storyCustomInstructions = stringPref(prefs, "storyCustomInstructions", true),
-        enablePass2        = boolPref(prefs, "enablePass2"),
+        preHints           = stringPref(prefs, "preHints", true),
+        storyPrompt        = stringPref(prefs, "storyPrompt", true),
+        storyEmphasis      = stringPref(prefs, "storyEmphasis", true),
         enableLogging      = boolPref(prefs, "enableLogging"),
         logFolder          = stringPref(prefs, "logFolder", true),
     }

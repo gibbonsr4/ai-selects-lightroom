@@ -153,6 +153,85 @@ local function deduplicateByTimestamp(entries, burstThresholdSecs)
     return result
 end
 
+-- ── Deduplicate by content description (near-duplicate detection) ────────
+-- Catches visually similar photos that burst dedup misses (e.g., trophy
+-- poses taken seconds apart at different timestamps). Compares word overlap
+-- in the AI-generated content descriptions + timestamp proximity.
+local CONTENT_DEDUP_WORD_OVERLAP = 0.60   -- fraction of shared words
+local CONTENT_DEDUP_TIME_WINDOW  = 60     -- seconds
+
+local function tokenize(text)
+    local words = {}
+    for word in (text or ""):lower():gmatch("%w+") do
+        if #word > 2 then  -- skip tiny words (a, of, in, etc.)
+            words[#words + 1] = word
+        end
+    end
+    return words
+end
+
+local function wordOverlap(wordsA, wordsB)
+    if #wordsA == 0 or #wordsB == 0 then return 0 end
+
+    local setB = {}
+    for _, w in ipairs(wordsB) do setB[w] = true end
+
+    local shared = 0
+    for _, w in ipairs(wordsA) do
+        if setB[w] then shared = shared + 1 end
+    end
+
+    -- Overlap relative to the smaller set
+    local smaller = math.min(#wordsA, #wordsB)
+    return shared / smaller
+end
+
+local function deduplicateByContent(entries)
+    if #entries < 2 then return entries, 0 end
+
+    -- Sort by composite score descending — keep higher-scored photo
+    local sorted = {}
+    for _, e in ipairs(entries) do sorted[#sorted + 1] = e end
+    table.sort(sorted, function(a, b)
+        return a.compositeScore > b.compositeScore
+    end)
+
+    -- Pre-tokenize all content descriptions
+    for _, e in ipairs(sorted) do
+        e._contentTokens = tokenize(e.content)
+    end
+
+    local kept = {}
+    local removed = 0
+
+    for _, candidate in ipairs(sorted) do
+        local dominated = false
+        for _, keeper in ipairs(kept) do
+            -- Only compare photos within the time window
+            if candidate.timestamp and keeper.timestamp then
+                local timeDiff = math.abs(candidate.timestamp - keeper.timestamp)
+                if timeDiff <= CONTENT_DEDUP_TIME_WINDOW then
+                    local overlap = wordOverlap(candidate._contentTokens, keeper._contentTokens)
+                    if overlap >= CONTENT_DEDUP_WORD_OVERLAP then
+                        dominated = true
+                        break
+                    end
+                end
+            end
+        end
+        if not dominated then
+            kept[#kept + 1] = candidate
+        else
+            removed = removed + 1
+        end
+    end
+
+    -- Clean up temporary tokens
+    for _, e in ipairs(kept) do e._contentTokens = nil end
+
+    return kept, removed
+end
+
 -- ── Deduplicate by perceptual hash ────────────────────────────────────────
 local PHASH_THRESHOLD = 10  -- out of 64 bits; <10 is very similar
 
@@ -860,118 +939,887 @@ local function selectStory(pool, settings, catalog, snapshots, progress)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- PASS 2 REFINEMENT — focused per-beat comparisons for story mode
+-- v3 STORY MODE: Multi-pass pipeline (Passes 2-3)
+-- Pass 2: Story Assembly (text-only → beat list)
+-- Pass 3A: Code pre-filter (hard constraints per beat)
+-- Pass 3B: AI text ranking (semantic matching per beat)
+-- Passes 4-6 (vision) will be added in later phases.
 -- ═══════════════════════════════════════════════════════════════════════════
 
-local function runPass2Refinement(selected, pool, settings, catalog, progress)
-    if not settings.enablePass2 then return 0 end
-    if settings.provider == "ollama" then return 0 end  -- not supported for local models
+local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, progress)
+    local targetCount = math.min(settings.targetCount, #pool)
+    local storyPrompt = settings.storyPrompt or ""
+    local storyEmphasis = settings.storyEmphasis or ""
 
-    -- Build entry lookup for alternates
-    local entryById = {}
-    for _, e in ipairs(pool) do
-        entryById[tostring(e.photo.localIdentifier)] = e
+    if storyPrompt == "" then
+        return nil, "No story prompt provided"
     end
 
-    local swapCount = 0
-    local total = 0
+    -- ── Pass 2: Story Assembly (text-only) ───────────────────────────────
+    progress:setCaption("Pass 2: Planning story beats...")
 
-    -- Count eligible beats first for progress
-    for _, e in ipairs(selected) do
-        if e.alternates and #e.alternates > 0 then
-            -- Check if any alternate is within 1 composite point
-            for _, altId in ipairs(e.alternates) do
-                local alt = entryById[altId]
-                if alt and math.abs(alt.compositeScore - e.compositeScore) <= 1.0 then
-                    total = total + 1
-                    break
+    -- Build event timeline from snapshots
+    local events = mergeSnapshots(snapshots)
+    local eventTimeline
+    if #events > 0 then
+        local eventParts = {}
+        for i, ev in ipairs(events) do
+            local batchRange = ""
+            if ev.batches and #ev.batches > 0 then
+                batchRange = string.format("Batches %s", table.concat(ev.batches, ","))
+            end
+            local timeStr = ""
+            if ev.timeRange and ev.timeRange.start then
+                timeStr = ev.timeRange.start
+                if ev.timeRange["end"] then
+                    timeStr = timeStr .. " to " .. ev.timeRange["end"]
+                end
+            end
+            local line = string.format("Event %d (%s, %s): %s",
+                i, batchRange, timeStr,
+                (ev.scene or "") .. ". " .. (ev.action or ""))
+            if ev.people and #ev.people > 0 then
+                line = line .. " People: " .. table.concat(ev.people, ", ") .. "."
+            end
+            if ev.mood and ev.mood ~= "" then
+                line = line .. " Mood: " .. ev.mood .. "."
+            end
+            eventParts[#eventParts + 1] = line
+        end
+        eventTimeline = table.concat(eventParts, "\n\n")
+    else
+        eventTimeline = "[No visual snapshots available — use photo metadata to infer events.]"
+    end
+
+    -- Build metadata rollup from photoStore
+    local rollup = Engine.buildMetadataRollup(photoStore)
+    rollup.targetCount = targetCount
+
+    -- Build all-photos text list (sorted chronologically)
+    local photoList = {}
+    for id, store in pairs(photoStore) do
+        if not store.reject then
+            photoList[#photoList + 1] = {
+                id = id,
+                store = store,
+                time = store.captureTime or 0,
+            }
+        end
+    end
+    table.sort(photoList, function(a, b) return a.time < b.time end)
+
+    local allPhotosLines = {}
+    for i, p in ipairs(photoList) do
+        local s = p.store
+        local timeStr = "unknown"
+        if s.captureTime then
+            timeStr = LrDate.timeToUserFormat(s.captureTime, "%H:%M:%S")
+        end
+        local peopleTxt = ""
+        if s.people and #s.people > 0 then
+            peopleTxt = ", people=[" .. table.concat(s.people, ", ") .. "]"
+        end
+        allPhotosLines[#allPhotosLines + 1] = string.format(
+            'Photo %d: composite=%.1f, T=%d C=%d E=%d M=%d, category=%s, eye=%s%s, time=%s\n  "%s"',
+            i, s.composite,
+            s.scores.technical, s.scores.composition, s.scores.emotion, s.scores.moment,
+            s.category, s.eyeQuality, peopleTxt, timeStr,
+            s.content
+        )
+    end
+    local allPhotosText = table.concat(allPhotosLines, "\n")
+
+    -- Build and send the story assembly prompt
+    local assemblyPrompt = Engine.buildStoryAssemblyPrompt(
+        storyPrompt, storyEmphasis, eventTimeline, rollup, allPhotosText, targetCount
+    )
+
+    Logger.info(string.format("Pass 2: Story assembly prompt length: %d chars, %d photos",
+        #assemblyPrompt, #photoList))
+
+    local maxTokens = BatchStrategy.getMaxTokens(settings.provider, "synthesis")
+    local assemblyResponse, assemblyErr = Engine.queryText(assemblyPrompt, settings, maxTokens)
+
+    if not assemblyResponse then
+        return nil, "Story assembly failed: " .. tostring(assemblyErr)
+    end
+
+    -- Parse beat list
+    local beatResult, beatErr = Engine.parseBeatListResponse(assemblyResponse)
+    if not beatResult then
+        return nil, "Could not parse story assembly: " .. tostring(beatErr)
+    end
+
+    local beats = beatResult.beats
+    Logger.info(string.format("Pass 2: Planned %d beats — \"%s\"",
+        #beats, beatResult.storyTitle or ""))
+    for _, beat in ipairs(beats) do
+        Logger.info(string.format("  Beat %d: %s [%s] (min_composite=%.1f)",
+            beat.position, beat.beat, beat.narrativeRole,
+            beat.searchCriteria.minComposite))
+    end
+    Logger.info("Pass 2 cost: " .. Engine.formatCostSummary())
+
+    -- ── Pass 3A: Code pre-filter ─────────────────────────────────────────
+    progress:setCaption("Pass 3: Filtering candidates per beat...")
+    progress:setPortionComplete(5, 10)
+
+    -- Build lookup from pool entries (keyed by localIdentifier)
+    local poolById = {}
+    for _, e in ipairs(pool) do
+        poolById[tostring(e.photo.localIdentifier)] = e
+    end
+
+    local usedIds = {}  -- track photos already selected for prior beats
+    local candidatesByBeat = {}
+
+    for beatIdx, beat in ipairs(beats) do
+        local sc = beat.searchCriteria
+        local candidates = {}
+
+        for _, e in ipairs(pool) do
+            local id = tostring(e.photo.localIdentifier)
+            local dominated = false
+
+            -- Hard filters
+            repeat
+                -- Already used by a prior beat
+                if usedIds[id] then dominated = true; break end
+
+                -- Reject filter
+                if e.reject then dominated = true; break end
+
+                -- Composite threshold
+                if e.compositeScore < sc.minComposite then dominated = true; break end
+
+                -- Eye quality filter (for portrait/people beats)
+                local isPersonBeat = false
+                if sc.categoryHint then
+                    for _, cat in ipairs(sc.categoryHint) do
+                        if cat == "portrait" or cat == "event" then isPersonBeat = true; break end
+                    end
+                end
+                if isPersonBeat and e.eyeQuality == "closed" then dominated = true; break end
+
+                -- People filter: if must_have mentions people, check face data
+                if sc.mustHave and #sc.mustHave > 0 then
+                    local store = photoStore[id]
+                    if store then
+                        for _, req in ipairs(sc.mustHave) do
+                            local reqLower = req:lower()
+                            -- Check for "all N people" or "group shot" requirements
+                            if reqLower:find("all") and reqLower:find("people") then
+                                -- Require 3+ people
+                                if not store.people or #store.people < 3 then
+                                    dominated = true; break
+                                end
+                            end
+                            -- Check for specific person name
+                            if store.people then
+                                for _, name in ipairs(store.people) do
+                                    if reqLower:find(name:lower()) then
+                                        -- Found the person, this requirement is satisfied
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            until true
+
+            if not dominated then
+                candidates[#candidates + 1] = {
+                    id        = id,
+                    entry     = e,
+                    content   = e.content,
+                    composite = e.compositeScore,
+                    category  = e.category,
+                    time      = e.timestamp and LrDate.timeToUserFormat(e.timestamp, "%H:%M:%S") or "unknown",
+                    people    = photoStore[id] and photoStore[id].people or {},
+                }
+            end
+        end
+
+        -- Sort by composite descending
+        table.sort(candidates, function(a, b) return a.composite > b.composite end)
+
+        -- If too few candidates, relax filters progressively
+        if #candidates < 8 then
+            Logger.info(string.format("  Beat %d: only %d candidates after filtering, relaxing...",
+                beatIdx, #candidates))
+            -- Re-run with lower composite threshold
+            local relaxed = {}
+            for _, e in ipairs(pool) do
+                local id = tostring(e.photo.localIdentifier)
+                if not usedIds[id] and not e.reject then
+                    relaxed[#relaxed + 1] = {
+                        id        = id,
+                        entry     = e,
+                        content   = e.content,
+                        composite = e.compositeScore,
+                        category  = e.category,
+                        time      = e.timestamp and LrDate.timeToUserFormat(e.timestamp, "%H:%M:%S") or "unknown",
+                        people    = photoStore[id] and photoStore[id].people or {},
+                    }
+                end
+            end
+            table.sort(relaxed, function(a, b) return a.composite > b.composite end)
+            -- Take top 30 (or all if fewer)
+            candidates = {}
+            for i = 1, math.min(30, #relaxed) do
+                candidates[#candidates + 1] = relaxed[i]
+            end
+        end
+
+        -- Cap candidates at 40 for the AI ranking call
+        if #candidates > 40 then
+            local capped = {}
+            for i = 1, 40 do capped[#capped + 1] = candidates[i] end
+            candidates = capped
+        end
+
+        candidatesByBeat[beatIdx] = candidates
+        Logger.info(string.format("  Beat %d: %d candidates for \"%s\"",
+            beatIdx, #candidates, beat.beat))
+    end
+
+    -- ── Pass 3B: AI text ranking (per beat) ──────────────────────────────
+    -- Ranks candidates semantically. Does NOT make final selections — Pass 4 does.
+    progress:setCaption("Pass 3B: AI ranking candidates per beat...")
+    progress:setPortionComplete(5, 10)
+
+    for beatIdx, beat in ipairs(beats) do
+        local candidates = candidatesByBeat[beatIdx]
+        if not candidates or #candidates == 0 then
+            Logger.warn(string.format("  Beat %d: no candidates, skipping", beatIdx))
+        elseif #candidates <= 3 or settings.provider == "ollama" then
+            -- Too few to rank, or Ollama (skip 3B) — already sorted by composite
+            Logger.info(string.format("  Beat %d: %d candidates, using composite order",
+                beatIdx, #candidates))
+        else
+            -- Build numbered candidate list for the AI
+            local numberedCandidates = {}
+            for i, c in ipairs(candidates) do
+                numberedCandidates[#numberedCandidates + 1] = {
+                    num       = i,
+                    content   = c.content,
+                    composite = c.composite,
+                    category  = c.category,
+                    people    = c.people,
+                    time      = c.time,
+                }
+            end
+
+            -- Build and send ranking prompt
+            local rankPrompt = Engine.buildCandidateRankingPrompt(
+                beatIdx, #beats, beat.description or beat.beat,
+                beat.narrativeRole, beat.searchCriteria, numberedCandidates
+            )
+
+            local rankResponse, rankErr = Engine.queryText(rankPrompt, settings, 256)
+
+            local ranked = nil
+            if rankResponse then
+                ranked, rankErr = Engine.parseCandidateRankingResponse(rankResponse)
+            end
+
+            -- Re-order candidates by AI ranking (keeping only top 8 for vision)
+            if ranked and #ranked > 0 then
+                local reordered = {}
+                local seen = {}
+                for _, pos in ipairs(ranked) do
+                    if pos >= 1 and pos <= #candidates and not seen[pos] then
+                        seen[pos] = true
+                        reordered[#reordered + 1] = candidates[pos]
+                    end
+                    if #reordered >= 8 then break end
+                end
+                -- Append any remaining candidates not in ranked list
+                for i, c in ipairs(candidates) do
+                    if not seen[i] and #reordered < 8 then
+                        reordered[#reordered + 1] = c
+                    end
+                end
+                candidatesByBeat[beatIdx] = reordered
+                Logger.info(string.format("  Beat %d: AI-ranked %d → top %d candidates",
+                    beatIdx, #candidates, #reordered))
+            else
+                -- AI ranking failed — keep composite order, trim to top 8
+                if #candidates > 8 then
+                    local trimmed = {}
+                    for i = 1, 8 do trimmed[i] = candidates[i] end
+                    candidatesByBeat[beatIdx] = trimmed
+                end
+                Logger.info(string.format("  Beat %d: ranking failed, using composite top %d",
+                    beatIdx, math.min(#candidates, 8)))
+            end
+        end
+    end
+    Logger.info("Pass 3 cost: " .. Engine.formatCostSummary())
+
+    -- ── Pre-render image cache for vision passes (4-6) ─────────────────────
+    -- Render JPEG thumbnails for all unique candidates so Passes 4-6 don't
+    -- re-render the same photo multiple times.
+    if settings.provider ~= "ollama" then
+        -- Collect all unique candidate photo IDs across all beats
+        local candidateIds = {}
+        local candidatePhotos = {}  -- id → photo object
+        for _, candidates in pairs(candidatesByBeat) do
+            for _, c in ipairs(candidates) do
+                if not candidateIds[c.id] then
+                    candidateIds[c.id] = true
+                    candidatePhotos[c.id] = c.entry.photo
                 end
             end
         end
+
+        -- Count how many need rendering (skip already-cached)
+        local toRender = {}
+        for id, photo in pairs(candidatePhotos) do
+            local store = photoStore[id]
+            if not store or not store.cachedImagePath then
+                toRender[#toRender + 1] = { id = id, photo = photo }
+            end
+        end
+
+        if #toRender > 0 then
+            Logger.info(string.format("Image cache: rendering %d candidate photos at %dpx",
+                #toRender, settings.renderSize))
+            progress:setCaption(string.format("Caching %d candidate images...", #toRender))
+
+            local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+            local cached = 0
+            for i, item in ipairs(toRender) do
+                local imgPath, imgSize = Engine.renderImage(item.photo, ts .. "_cache_" .. i, settings.renderSize)
+                if imgPath then
+                    if not photoStore[item.id] then
+                        photoStore[item.id] = {}
+                    end
+                    photoStore[item.id].cachedImagePath = imgPath
+                    cached = cached + 1
+                else
+                    Logger.warn(string.format("Image cache: failed to render %s", item.id))
+                end
+                LrTasks.yield()
+            end
+            Logger.info(string.format("Image cache: %d/%d rendered successfully", cached, #toRender))
+        end
     end
 
-    if total == 0 then
-        Logger.info("Pass 2: no close-scoring alternates found, skipping")
-        return 0
+    -- ── Pass 4: Beat Casting (vision) ─────────────────────────────────────
+    -- For cloud providers: send candidate images per beat, AI picks best match.
+    -- For Ollama: use text-ranked order (skip vision casting).
+    progress:setCaption("Pass 4: Vision beat casting...")
+    progress:setPortionComplete(6, 10)
+
+    -- Reset usedIds for final selection pass
+    usedIds = {}
+    local finalSelection = {}
+    local beatResults = {}   -- {primary=id, backup=id, flag=...} per beat
+
+    if settings.provider == "ollama" then
+        -- Ollama: skip vision casting, use text-ranked/composite order
+        Logger.info("Pass 4: Ollama — using text-ranked selections (no vision)")
+        for beatIdx, beat in ipairs(beats) do
+            local candidates = candidatesByBeat[beatIdx]
+            if candidates and #candidates > 0 then
+                for _, c in ipairs(candidates) do
+                    if not usedIds[c.id] then
+                        usedIds[c.id] = true
+                        local e = c.entry
+                        e.storyBeat     = beat.beat
+                        e.storyRole     = beat.narrativeRole
+                        e.storyNote     = beat.description
+                        e.storyPosition = beat.position
+                        finalSelection[#finalSelection + 1] = e
+                        beatResults[beatIdx] = { primaryId = c.id }
+                        Logger.info(string.format("  Beat %d: selected — %s",
+                            beatIdx, (c.content or ""):sub(1, 60)))
+                        break
+                    end
+                end
+            end
+        end
+    else
+        -- Cloud providers: vision-based beat casting in sequential waves
+        -- Waves of 3 beats: each wave sees previous selections as context
+        local WAVE_SIZE = 3
+        local previousSelections = {}  -- {position, content} for redundancy context
+
+        local totalWaves = math.ceil(#beats / WAVE_SIZE)
+        for waveIdx = 1, totalWaves do
+            local waveStart = (waveIdx - 1) * WAVE_SIZE + 1
+            local waveEnd   = math.min(waveIdx * WAVE_SIZE, #beats)
+
+            Logger.info(string.format("Pass 4: Wave %d/%d — beats %d-%d",
+                waveIdx, totalWaves, waveStart, waveEnd))
+            progress:setCaption(string.format("Pass 4: Beat casting (wave %d/%d)...",
+                waveIdx, totalWaves))
+
+            for beatIdx = waveStart, waveEnd do
+                local beat = beats[beatIdx]
+                local candidates = candidatesByBeat[beatIdx]
+
+                if not candidates or #candidates == 0 then
+                    Logger.warn(string.format("  Beat %d: no candidates, skipping", beatIdx))
+                else
+                    -- Render candidate images
+                    local images = {}     -- {base64, fileSize}
+                    local labels = {}     -- "[Photo N]"
+                    local validCandidates = {}  -- candidates with successful renders
+
+                    local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+                    for i, c in ipairs(candidates) do
+                        if usedIds[c.id] then
+                            -- Skip already-used photos
+                        else
+                            -- Check photoStore for cached image or render fresh
+                            local store = photoStore[c.id]
+                            local img = nil
+                            if store and store.cachedImagePath then
+                                -- Read from cache
+                                local data = Engine.readBinaryFile(store.cachedImagePath)
+                                if data then
+                                    img = {
+                                        base64   = Engine.base64Encode(data),
+                                        fileSize = #data,
+                                    }
+                                end
+                            end
+                            if not img then
+                                -- Render fresh for beat casting
+                                img = Engine.prepareImage(c.entry.photo,
+                                    ts .. "_b" .. beatIdx .. "_" .. i,
+                                    settings.provider, settings.renderSize)
+                            end
+                            if img then
+                                images[#images + 1] = img
+                                labels[#labels + 1] = string.format("[Photo %d]", #images)
+                                validCandidates[#validCandidates + 1] = c
+                            else
+                                Logger.warn(string.format("  Beat %d: failed to render candidate %s",
+                                    beatIdx, c.id))
+                            end
+                        end
+                        -- Cap at 8 images per beat
+                        if #images >= 8 then break end
+                    end
+
+                    if #images == 0 then
+                        Logger.warn(string.format("  Beat %d: no renderable candidates", beatIdx))
+                    elseif #images == 1 then
+                        -- Only one candidate — auto-select
+                        local c = validCandidates[1]
+                        usedIds[c.id] = true
+                        local e = c.entry
+                        e.storyBeat     = beat.beat
+                        e.storyRole     = beat.narrativeRole
+                        e.storyNote     = beat.description
+                        e.storyPosition = beat.position
+                        finalSelection[#finalSelection + 1] = e
+                        beatResults[beatIdx] = { primaryId = c.id }
+                        previousSelections[#previousSelections + 1] = {
+                            position = beat.position,
+                            content  = c.content or "",
+                        }
+                        Logger.info(string.format("  Beat %d: auto-selected (only candidate) — %s",
+                            beatIdx, (c.content or ""):sub(1, 60)))
+                    else
+                        -- Build and send vision prompt
+                        local castPrompt = Engine.buildBeatCastingPrompt(
+                            storyPrompt, beat.position, #beats,
+                            beat.description or beat.beat,
+                            beat.narrativeRole, beat.searchCriteria,
+                            #images, previousSelections
+                        )
+
+                        local castResponse, castErr = Engine.queryVision(
+                            images, labels, castPrompt, settings, 512)
+
+                        local castResult = nil
+                        if castResponse then
+                            castResult, castErr = Engine.parseBeatCastingResponse(castResponse)
+                        end
+
+                        -- Select primary pick
+                        local picked = false
+                        if castResult and castResult.primary then
+                            local priPos = castResult.primary
+                            if priPos >= 1 and priPos <= #validCandidates then
+                                local c = validCandidates[priPos]
+                                if not usedIds[c.id] then
+                                    usedIds[c.id] = true
+                                    local e = c.entry
+                                    e.storyBeat     = beat.beat
+                                    e.storyRole     = beat.narrativeRole
+                                    e.storyNote     = beat.description
+                                    e.storyPosition = beat.position
+                                    finalSelection[#finalSelection + 1] = e
+                                    picked = true
+
+                                    -- Record backup and flag
+                                    local backupId = nil
+                                    if castResult.backup and castResult.backup >= 1
+                                       and castResult.backup <= #validCandidates then
+                                        backupId = validCandidates[castResult.backup].id
+                                    end
+                                    beatResults[beatIdx] = {
+                                        primaryId = c.id,
+                                        backupId  = backupId,
+                                        flag      = castResult.flag,
+                                        reasoning = castResult.reasoning,
+                                    }
+
+                                    previousSelections[#previousSelections + 1] = {
+                                        position = beat.position,
+                                        content  = c.content or "",
+                                    }
+                                    Logger.info(string.format(
+                                        "  Beat %d: vision selected #%d%s — %s",
+                                        beatIdx, priPos,
+                                        castResult.flag and (" [" .. castResult.flag .. "]") or "",
+                                        (c.content or ""):sub(1, 60)))
+                                end
+                            end
+                        end
+
+                        -- Fallback: first unused candidate
+                        if not picked then
+                            Logger.warn(string.format("  Beat %d: vision casting failed (%s), using fallback",
+                                beatIdx, castErr or "unknown"))
+                            for _, c in ipairs(validCandidates) do
+                                if not usedIds[c.id] then
+                                    usedIds[c.id] = true
+                                    local e = c.entry
+                                    e.storyBeat     = beat.beat
+                                    e.storyRole     = beat.narrativeRole
+                                    e.storyNote     = beat.description
+                                    e.storyPosition = beat.position
+                                    finalSelection[#finalSelection + 1] = e
+                                    beatResults[beatIdx] = { primaryId = c.id }
+                                    previousSelections[#previousSelections + 1] = {
+                                        position = beat.position,
+                                        content  = c.content or "",
+                                    }
+                                    Logger.info(string.format("  Beat %d: fallback — %s",
+                                        beatIdx, (c.content or ""):sub(1, 60)))
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end  -- beats in wave
+        end  -- waves
+    end  -- cloud vs ollama
+    Logger.info("Pass 4 cost: " .. Engine.formatCostSummary())
+
+    -- ── Pass 5: Story Review (vision) ─────────────────────────────────────
+    -- Send final selection as images in story order for review.
+    -- Skip for Ollama (too slow) or very small selections.
+    if settings.provider ~= "ollama" and #finalSelection >= 5 then
+        progress:setCaption("Pass 5: Reviewing story selection...")
+        progress:setPortionComplete(7.5, 10)
+
+        -- Sort by position for review
+        table.sort(finalSelection, function(a, b)
+            return (a.storyPosition or 0) < (b.storyPosition or 0)
+        end)
+
+        -- Batch review: up to 15 images per batch, 3-photo overlap
+        local REVIEW_BATCH_SIZE = 15
+        local REVIEW_OVERLAP    = 3
+        local batchSummary = ""
+        local allSwapRecs = {}
+
+        local batchStart = 1
+        while batchStart <= #finalSelection do
+            local batchEnd = math.min(batchStart + REVIEW_BATCH_SIZE - 1, #finalSelection)
+
+            -- Render images for this review batch
+            local reviewImages = {}
+            local reviewLabels = {}
+            local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+
+            for i = batchStart, batchEnd do
+                local e = finalSelection[i]
+                local img = nil
+
+                -- Try cached image
+                local id = tostring(e.photo.localIdentifier)
+                local store = photoStore[id]
+                if store and store.cachedImagePath then
+                    local data = Engine.readBinaryFile(store.cachedImagePath)
+                    if data then
+                        img = {
+                            base64   = Engine.base64Encode(data),
+                            fileSize = #data,
+                        }
+                    end
+                end
+                if not img then
+                    img = Engine.prepareImage(e.photo, ts .. "_rev" .. i,
+                        settings.provider, settings.renderSize)
+                end
+                if img then
+                    reviewImages[#reviewImages + 1] = img
+                    reviewLabels[#reviewLabels + 1] = string.format(
+                        "[Photo %d — Beat: %s]", e.storyPosition or i,
+                        (e.storyBeat or ""):sub(1, 40))
+                end
+            end
+
+            if #reviewImages > 0 then
+                local beatRange = string.format("%d-%d", batchStart, batchEnd)
+                local reviewPrompt = Engine.buildStoryReviewPrompt(
+                    storyPrompt, beats, beatRange, batchSummary)
+
+                local reviewResponse, reviewErr = Engine.queryVision(
+                    reviewImages, reviewLabels, reviewPrompt, settings, 2048)
+
+                if reviewResponse then
+                    local review, parseErr = Engine.parseStoryReviewResponse(reviewResponse)
+                    if review then
+                        batchSummary = review.batchSummary or ""
+                        Logger.info(string.format("Pass 5: story coherence = %d/10. %s",
+                            review.storyCoherence, review.coherenceNotes or ""))
+
+                        -- Collect swap recommendations (deduplicate by position)
+                        -- AI uses story positions from photo labels
+                        local seenSwapPos = {}
+                        for _, existing in ipairs(allSwapRecs) do
+                            seenSwapPos[existing.position] = true
+                        end
+                        for _, swap in ipairs(review.swapRecommendations) do
+                            if swap.position and not seenSwapPos[swap.position] then
+                                seenSwapPos[swap.position] = true
+                                allSwapRecs[#allSwapRecs + 1] = {
+                                    position = swap.position,
+                                    reason   = swap.reason,
+                                    lookFor  = swap.look_for,
+                                }
+                            end
+                        end
+
+                        -- Log duplicates and gaps
+                        if review.duplicates and #review.duplicates > 0 then
+                            for _, dup in ipairs(review.duplicates) do
+                                Logger.info(string.format("  Duplicate: positions %s — %s",
+                                    table.concat(dup.positions or {}, ","), dup.description or ""))
+                            end
+                        end
+                        if review.gaps and #review.gaps > 0 then
+                            for _, gap in ipairs(review.gaps) do
+                                Logger.info(string.format("  Gap: %s",
+                                    gap.suggestion or gap.missing or ""))
+                            end
+                        end
+                    else
+                        Logger.warn("Pass 5: review parse failed: " .. (parseErr or "unknown"))
+                    end
+                else
+                    Logger.warn("Pass 5: review call failed: " .. (reviewErr or "unknown"))
+                end
+            end
+
+            -- Next batch with overlap
+            if batchEnd >= #finalSelection then
+                break  -- done
+            end
+            batchStart = batchEnd - REVIEW_OVERLAP + 1
+        end
+
+        -- ── Pass 6: Swap Resolution (vision) ─────────────────────────────
+        -- One round of swaps only (no cascade).
+        if #allSwapRecs > 0 then
+            progress:setCaption("Pass 6: Resolving swaps...")
+            progress:setPortionComplete(8.5, 10)
+            Logger.info(string.format("Pass 6: %d swap recommendations to evaluate", #allSwapRecs))
+
+            local swapCount = 0
+            for _, swap in ipairs(allSwapRecs) do
+                local selIdx = nil
+                for i, e in ipairs(finalSelection) do
+                    if (e.storyPosition or 0) == swap.position then
+                        selIdx = i
+                        break
+                    end
+                end
+                if not selIdx then
+                    Logger.warn(string.format("  Swap position %d: not found in selection", swap.position))
+                else
+                    local currentEntry = finalSelection[selIdx]
+                    local currentId = tostring(currentEntry.photo.localIdentifier)
+
+                    -- Find the beat for this position
+                    local beatForSwap = nil
+                    for _, b in ipairs(beats) do
+                        if b.position == swap.position then beatForSwap = b; break end
+                    end
+
+                    -- Build replacement candidate list
+                    local replacements = {}
+                    -- Find the beat index (may differ from position if gaps exist)
+                    local beatIdx = nil
+                    for i, b in ipairs(beats) do
+                        if b.position == swap.position then beatIdx = i; break end
+                    end
+                    beatIdx = beatIdx or swap.position  -- fallback
+                    if beatResults[beatIdx] and beatResults[beatIdx].backupId
+                       and not usedIds[beatResults[beatIdx].backupId] then
+                        -- Find the candidate entry for the backup
+                        for _, c in ipairs(candidatesByBeat[beatIdx] or {}) do
+                            if c.id == beatResults[beatIdx].backupId then
+                                replacements[#replacements + 1] = c
+                                break
+                            end
+                        end
+                    end
+                    -- Then: other unused candidates for this beat
+                    for _, c in ipairs(candidatesByBeat[beatIdx] or {}) do
+                        if c.id ~= currentId and not usedIds[c.id] then
+                            local isDup = false
+                            for _, r in ipairs(replacements) do
+                                if r.id == c.id then isDup = true; break end
+                            end
+                            if not isDup then
+                                replacements[#replacements + 1] = c
+                            end
+                        end
+                        if #replacements >= 4 then break end
+                    end
+
+                    if #replacements == 0 then
+                        Logger.info(string.format("  Swap position %d: no replacement candidates", swap.position))
+                    else
+                        -- Render current + replacements
+                        local swapImages = {}
+                        local swapLabels = {}
+                        local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+
+                        -- Current photo is Photo 1
+                        local store = photoStore[currentId]
+                        local currentImg = nil
+                        if store and store.cachedImagePath then
+                            local data = Engine.readBinaryFile(store.cachedImagePath)
+                            if data then
+                                currentImg = {
+                                    base64   = Engine.base64Encode(data),
+                                    fileSize = #data,
+                                }
+                            end
+                        end
+                        if not currentImg then
+                            currentImg = Engine.prepareImage(currentEntry.photo,
+                                ts .. "_swap_cur", settings.provider, settings.renderSize)
+                        end
+                        if currentImg then
+                            swapImages[#swapImages + 1] = currentImg
+                            swapLabels[#swapLabels + 1] = "[Photo 1 — CURRENT]"
+                        end
+
+                        -- Replacement photos
+                        local validReplacements = {}
+                        for i, r in ipairs(replacements) do
+                            local rImg = nil
+                            local rStore = photoStore[r.id]
+                            if rStore and rStore.cachedImagePath then
+                                local data = Engine.readBinaryFile(rStore.cachedImagePath)
+                                if data then
+                                    rImg = {
+                                        base64   = Engine.base64Encode(data),
+                                        fileSize = #data,
+                                    }
+                                end
+                            end
+                            if not rImg then
+                                rImg = Engine.prepareImage(r.entry.photo,
+                                    ts .. "_swap_r" .. i, settings.provider, settings.renderSize)
+                            end
+                            if rImg then
+                                swapImages[#swapImages + 1] = rImg
+                                swapLabels[#swapLabels + 1] = string.format("[Photo %d — REPLACEMENT]", #swapImages)
+                                validReplacements[#validReplacements + 1] = r
+                            end
+                        end
+
+                        if #swapImages >= 2 then
+                            local swapPrompt = Engine.buildSwapResolutionPrompt(
+                                storyPrompt, swap.position,
+                                beatForSwap and (beatForSwap.description or beatForSwap.beat) or "",
+                                swap.reason, swap.lookFor, #validReplacements)
+
+                            local swapResponse, swapErr = Engine.queryVision(
+                                swapImages, swapLabels, swapPrompt, settings, 512)
+
+                            if swapResponse then
+                                local swapResult, parseErr = Engine.parseSwapResolutionResponse(swapResponse)
+                                if swapResult and swapResult.action == "swap" and swapResult.replacement then
+                                    -- replacement index is 2-based (1 is current)
+                                    local repIdx = swapResult.replacement - 1
+                                    if repIdx >= 1 and repIdx <= #validReplacements then
+                                        local newC = validReplacements[repIdx]
+                                        -- Perform swap
+                                        usedIds[currentId] = nil
+                                        usedIds[newC.id] = true
+                                        local e = newC.entry
+                                        e.storyBeat     = currentEntry.storyBeat
+                                        e.storyRole     = currentEntry.storyRole
+                                        e.storyNote     = currentEntry.storyNote
+                                        e.storyPosition = currentEntry.storyPosition
+                                        finalSelection[selIdx] = e
+                                        swapCount = swapCount + 1
+                                        Logger.info(string.format(
+                                            "  Swap position %d: replaced with %s — %s",
+                                            swap.position, newC.id,
+                                            (swapResult.reasoning or ""):sub(1, 80)))
+                                    end
+                                else
+                                    Logger.info(string.format("  Swap position %d: keeping current — %s",
+                                        swap.position, (swapResult and swapResult.reasoning or ""):sub(1, 80)))
+                                end
+                            else
+                                Logger.warn(string.format("  Swap position %d: vision call failed: %s",
+                                    swap.position, swapErr or "unknown"))
+                            end
+                        end
+                    end
+                end
+            end
+            Logger.info(string.format("Pass 6: %d swaps applied of %d recommended",
+                swapCount, #allSwapRecs))
+        end
+    else
+        if settings.provider == "ollama" then
+            Logger.info("Passes 5-6: skipped (Ollama)")
+        else
+            Logger.info("Passes 5-6: skipped (selection too small)")
+        end
     end
 
-    Logger.info(string.format("Pass 2: %d beats with close alternates to compare", total))
-    local completed = 0
+    -- ── Final sort and return ─────────────────────────────────────────────
+    table.sort(finalSelection, function(a, b)
+        return (a.storyPosition or 0) < (b.storyPosition or 0)
+    end)
 
-    for i, e in ipairs(selected) do repeat
-        if not e.alternates or #e.alternates == 0 then break end
+    Logger.info(string.format("v3 Story: selected %d photos for %d beats",
+        #finalSelection, #beats))
+    Logger.info("Total pipeline cost: " .. Engine.formatCostSummary())
 
-        -- Collect close-scoring alternates
-        local closeAlts = {}
-        for _, altId in ipairs(e.alternates) do
-            local alt = entryById[altId]
-            if alt and math.abs(alt.compositeScore - e.compositeScore) <= 1.0 then
-                closeAlts[#closeAlts + 1] = alt
-            end
+    -- Clean up cached image files
+    local cleanedUp = 0
+    for id, store in pairs(photoStore) do
+        if store.cachedImagePath then
+            Engine.safeDelete(store.cachedImagePath)
+            store.cachedImagePath = nil
+            cleanedUp = cleanedUp + 1
         end
-        if #closeAlts == 0 then break end
+    end
+    if cleanedUp > 0 then
+        Logger.info(string.format("Image cache: cleaned up %d temp files", cleanedUp))
+    end
 
-        -- Render primary + alternates
-        completed = completed + 1
-        if progress then
-            progress:setCaption(string.format("Pass 2 refinement (%d/%d)...", completed, total))
-        end
-
-        local images = {}
-        local imageIds = {}
-
-        -- Render primary
-        local ts = tostring(LrDate.currentTime()) .. "_p2_" .. i
-        local primaryImg = Engine.prepareImage(e.photo, ts .. "_pri", settings.provider, settings.renderSize)
-        if not primaryImg then break end
-
-        images[1] = primaryImg
-        imageIds[1] = tostring(e.photo.localIdentifier)
-
-        -- Render alternates (max 2)
-        local allRendered = true
-        for j, alt in ipairs(closeAlts) do
-            if j > 2 then break end
-            local altImg = Engine.prepareImage(alt.photo, ts .. "_alt" .. j, settings.provider, settings.renderSize)
-            if altImg then
-                images[#images + 1] = altImg
-                imageIds[#imageIds + 1] = tostring(alt.photo.localIdentifier)
-            else
-                allRendered = false
-            end
-        end
-
-        if #images < 2 then break end
-
-        -- Query Pass 2
-        local selectedId, p2Err = Engine.queryPass2(
-            images, imageIds,
-            e.storyBeat or "", e.storyRole or "", e.storyNote or "",
-            settings
-        )
-
-        -- Note: prepareImage() handles temp file cleanup internally,
-        -- so no cleanup needed here.
-
-        if selectedId and selectedId ~= imageIds[1] then
-            -- Swap: the alternate was judged better
-            local newEntry = entryById[selectedId]
-            if newEntry then
-                newEntry.storyNote     = e.storyNote .. " (Pass 2 swap)"
-                newEntry.storyBeat     = e.storyBeat
-                newEntry.storyRole     = e.storyRole
-                newEntry.storyPosition = e.storyPosition
-                selected[i] = newEntry
-                swapCount = swapCount + 1
-                Logger.info(string.format("Pass 2: swapped beat %d — %s → %s",
-                    i, imageIds[1], selectedId))
-            end
-        end
-
-    until true end
-
-    Logger.info(string.format("Pass 2: %d swaps out of %d comparisons", swapCount, total))
-    return swapCount
+    return finalSelection, nil
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -1009,6 +1857,9 @@ local function runSelection(context, overrides, snapshots)
         functionContext = context,
     }
     progress:setPortionComplete(0, 10)
+
+    -- Reset cost tracker for selection phase (scoring has its own tracker)
+    Engine.resetCostTracker()
 
     -- Read scores from all selected photos
     progress:setCaption("Reading scores...")
@@ -1050,6 +1901,64 @@ local function runSelection(context, overrides, snapshots)
     end
 
     local totalScored = #scored
+
+    -- ── Build photoStore: central in-memory data for all passes ─────────
+    -- Indexed by localIdentifier. Single source of truth for Passes 2-6.
+    -- Populated once here; downstream passes reference it, never re-read LR metadata.
+    local photoStore = {}
+    for _, e in ipairs(scored) do
+        local id = e.photo.localIdentifier
+        local captureTime = e.photo:getRawMetadata('dateTimeOriginal')
+
+        -- Read EXIF data
+        local exifParts = {}
+        local isoVal = e.photo:getRawMetadata('isoSpeedRating')
+        if isoVal then exifParts[#exifParts + 1] = "ISO " .. tostring(isoVal) end
+        local shutterVal = e.photo:getFormattedMetadata('shutterSpeed')
+        if shutterVal and shutterVal ~= "" then exifParts[#exifParts + 1] = shutterVal end
+        local apertureVal = e.photo:getFormattedMetadata('aperture')
+        if apertureVal and apertureVal ~= "" then exifParts[#exifParts + 1] = apertureVal end
+        local focalVal = e.photo:getFormattedMetadata('focalLength')
+        if focalVal and focalVal ~= "" then exifParts[#exifParts + 1] = focalVal end
+
+        photoStore[id] = {
+            photo        = e.photo,
+            filename     = e.photo:getFormattedMetadata('fileName'),
+            scores       = {
+                technical   = e.technical,
+                composition = e.composition,
+                emotion     = e.emotion,
+                moment      = e.moment,
+            },
+            composite    = e.compositeScore,
+            content      = e.content,
+            category     = e.category,
+            eyeQuality   = e.eyeQuality,
+            reject       = e.reject,
+            captureTime  = captureTime,
+            exif         = #exifParts > 0 and table.concat(exifParts, ", ") or nil,
+            people       = {},   -- populated by face query later
+            batchIndex   = nil,  -- populated during story mode if snapshots available
+            cachedImagePath = nil,  -- populated when image cache is built (Passes 4-6)
+        }
+    end
+
+    -- Populate people data from face query (once, upfront)
+    local allPhotos = {}
+    for _, e in ipairs(scored) do allPhotos[#allPhotos + 1] = e.photo end
+    local faceMap = Engine.queryFacePeople(catalog, allPhotos)
+    if faceMap then
+        for id, store in pairs(photoStore) do
+            local names = faceMap[id]
+            if names then store.people = names end
+        end
+        Logger.info("Face data loaded for photoStore")
+    else
+        Logger.info("Face query unavailable — photoStore.people will be empty")
+    end
+
+    Logger.info("photoStore built: " .. tostring(totalScored) .. " entries")
+
     progress:setPortionComplete(1, 10)
 
     -- ── Shared pipeline: reject + dedup ───────────────────────────────────
@@ -1075,8 +1984,13 @@ local function runSelection(context, overrides, snapshots)
 
     -- Step 2b: Deduplicate by perceptual hash (visual similarity)
     progress:setCaption("Removing visual duplicates...")
+    progress:setPortionComplete(2.5, 10)
+    local afterPhashDedup, phashDupCount = deduplicateByPhash(afterTimestampDedup)
+
+    -- Step 2c: Deduplicate by content description (near-duplicate detection)
+    progress:setCaption("Removing content duplicates...")
     progress:setPortionComplete(3, 10)
-    local afterDedup, phashDupCount = deduplicateByPhash(afterTimestampDedup)
+    local afterDedup, contentDupCount = deduplicateByContent(afterPhashDedup)
 
     -- ── Mode dispatch ─────────────────────────────────────────────────────
     progress:setPortionComplete(4, 10)
@@ -1085,26 +1999,34 @@ local function runSelection(context, overrides, snapshots)
     local groupOrder = {}
     local storyFallback = false
     local gapsFilled = 0
-    local pass2Swaps = 0
-
     if mode == "story" then
-        progress:setCaption("Querying AI for narrative selection...")
-        local storySelected, storyErr, storyGaps = selectStory(
-            afterDedup, SETTINGS, catalog, snapshots, progress)
-        if storySelected then
-            selected = storySelected
-            gapsFilled = storyGaps or 0
-
-            -- Pass 2 refinement (optional)
-            if SETTINGS.enablePass2 and SETTINGS.provider ~= "ollama" then
-                progress:setPortionComplete(6, 10)
-                pass2Swaps = runPass2Refinement(selected, afterDedup, SETTINGS, catalog, progress)
+        -- v3 story pipeline: use selectStoryV3 when user confirmed a story prompt
+        if SETTINGS.storyPrompt and SETTINGS.storyPrompt ~= "" then
+            Logger.info("Story mode: using v3 multi-pass pipeline")
+            progress:setCaption("Building story (Pass 2-3)...")
+            local storySelected, storyErr = selectStoryV3(
+                afterDedup, SETTINGS, catalog, snapshots, photoStore, progress)
+            if storySelected then
+                selected = storySelected
+            else
+                Logger.warn("Story v3 failed: " .. tostring(storyErr) .. " — falling back to Best Of")
+                storyFallback = true
+                selected, groupOrder = selectBestOf(afterDedup, SETTINGS)
             end
         else
-            -- Fallback to Best Of with warning
-            Logger.warn("Story mode failed: " .. tostring(storyErr) .. " — falling back to Best Of")
-            storyFallback = true
-            selected, groupOrder = selectBestOf(afterDedup, SETTINGS)
+            -- v2 fallback: no story prompt means user didn't go through mid-run dialog
+            Logger.info("Story mode: using v2 pipeline (no story prompt)")
+            progress:setCaption("Querying AI for narrative selection...")
+            local storySelected, storyErr, storyGaps = selectStory(
+                afterDedup, SETTINGS, catalog, snapshots, progress)
+            if storySelected then
+                selected = storySelected
+                gapsFilled = storyGaps or 0
+            else
+                Logger.warn("Story mode failed: " .. tostring(storyErr) .. " — falling back to Best Of")
+                storyFallback = true
+                selected, groupOrder = selectBestOf(afterDedup, SETTINGS)
+            end
         end
     else
         progress:setCaption("Selecting best photos...")
@@ -1279,14 +2201,14 @@ local function runSelection(context, overrides, snapshots)
     if phashDupCount > 0 then
         lines[#lines + 1] = string.format("%d visual duplicates removed (perceptual hash)", phashDupCount)
     end
+    if contentDupCount > 0 then
+        lines[#lines + 1] = string.format("%d content duplicates removed (description similarity)", contentDupCount)
+    end
     if gapsFilled > 0 then
         lines[#lines + 1] = string.format("%d photo(s) added to fill narrative gaps", gapsFilled)
     end
     if faceAddedCount > 0 then
         lines[#lines + 1] = string.format("%d photo(s) added to ensure face coverage", faceAddedCount)
-    end
-    if pass2Swaps > 0 then
-        lines[#lines + 1] = string.format("%d photo(s) swapped by Pass 2 refinement", pass2Swaps)
     end
     if #selected > targetCount then
         lines[#lines + 1] = string.format(
@@ -1323,6 +2245,13 @@ local function runSelection(context, overrides, snapshots)
     if mode == "story" and not storyFallback then
         lines[#lines + 1] = ""
         lines[#lines + 1] = "Tip: Set sort order to 'Custom Order' in the toolbar to view photos in story sequence."
+    end
+
+    -- Cost summary (selection passes only — does not include Pass 1 scoring)
+    local costSummary = Engine.getCostSummary()
+    if costSummary.callCount > 0 then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Selection cost: " .. Engine.formatCostSummary()
     end
 
     progress:done()
