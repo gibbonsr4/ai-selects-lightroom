@@ -2,8 +2,12 @@
   ScoreAndSelect.lua
   ─────────────────────────────────────────────────────────────────────────────
   Primary entry point for AI Selects. Shows a run configuration dialog with
-  mode, story settings, target count, and weights, then runs Pass 1 (Score)
-  followed by Pass 2 (Select) sequentially.
+  mode, story settings, scoring quality, emphasis slider, and target count,
+  then runs Pass 1 (Score) followed by Pass 2 (Select) sequentially.
+
+  v2: Nitpicky scale replaces calibration. Emphasis slider replaces
+      percentage input. Pass 2 refinement checkbox for story mode.
+      Batch size override. Snapshots flow from scoring into story selection.
 
   Settings from the run dialog are saved to prefs so they persist between runs.
   Provider/model/logging configuration is in Settings (Config.lua).
@@ -22,7 +26,7 @@ local LrView            = import 'LrView'
 local Prefs        = dofile(_PLUGIN.path .. '/Prefs.lua')
 local StoryPresets = dofile(_PLUGIN.path .. '/StoryPresets.lua')
 
--- ── Build story preset dropdown items ────────────────────────────────────
+-- ── Build story preset dropdown items ──────────────────────────────────────
 local function buildPresetItems()
     local items = {}
     for _, preset in ipairs(StoryPresets.presets) do
@@ -31,12 +35,12 @@ local function buildPresetItems()
     return items
 end
 
--- ── Lookup preset by ID ──────────────────────────────────────────────────
+-- ── Lookup preset by ID ────────────────────────────────────────────────────
 local function getPresetById(id)
     return StoryPresets.getPreset(id)
 end
 
--- ── Run configuration dialog ─────────────────────────────────────────────
+-- ── Run configuration dialog ───────────────────────────────────────────────
 -- Returns settings table or nil if user canceled.
 local function showRunDialog(context)
     local current = Prefs.getPrefs()
@@ -45,13 +49,15 @@ local function showRunDialog(context)
     local props = LrBinding.makePropertyTable(context)
 
     -- Pre-fill from saved prefs
-    props.selectionMode         = current.selectionMode or "bestof"
-    props.targetCount           = tostring(current.targetCount)
-    props.technicalPct          = tostring(current.technicalPct)
-    props.varietyMode            = current.varietyMode or "proportional"
-    props.storyPreset           = current.storyPreset or "family_vacation"
+    props.selectionMode          = current.selectionMode or "bestof"
+    props.targetCount            = tostring(current.targetCount or 40)
+    props.emphasisSlider         = current.emphasisSlider or 50
+    props.nitpickyScale          = current.nitpickyScale or "consumer"
+    props.storyPreset            = current.storyPreset or "family_vacation"
     props.storyCustomInstructions = current.storyCustomInstructions or ""
-    props.enableCalibration       = current.enableCalibration
+    props.enablePass2            = current.enablePass2 or false
+    props.skipScored             = current.skipScored or false
+    props.batchSize              = tostring(current.batchSize or 0)
 
     -- Preset description (dynamic)
     local preset = getPresetById(props.storyPreset)
@@ -81,6 +87,25 @@ local function showRunDialog(context)
     local targetPhotos = catalog:getTargetPhotos()
     local photoCount = #targetPhotos
     props.photoCountInfo = string.format("%d photo(s) selected", photoCount)
+
+    -- Emphasis label (dynamic)
+    props.emphasisLabel = ""
+    local function updateEmphasisLabel()
+        local val = props.emphasisSlider or 50
+        if val <= 15 then
+            props.emphasisLabel = "Heavy technical"
+        elseif val <= 35 then
+            props.emphasisLabel = "Technical-leaning"
+        elseif val <= 65 then
+            props.emphasisLabel = "Balanced"
+        elseif val <= 85 then
+            props.emphasisLabel = "Creative-leaning"
+        else
+            props.emphasisLabel = "Heavy creative"
+        end
+    end
+    updateEmphasisLabel()
+    props:addObserver("emphasisSlider", function() updateEmphasisLabel() end)
 
     local contents = f:column {
         spacing         = f:dialog_spacing(),
@@ -170,23 +195,58 @@ local function showRunDialog(context)
                     title = "",
                     width = LrView.share("run_label_width"),
                 },
-                f:static_text {
-                    title      = "Optional. Appended to any preset to further guide the AI.",
-                    text_color = LrView.kDisabledColor,
+                f:checkbox {
+                    title = "Refine selections with focused comparisons (slower)",
+                    value = LrView.bind("enablePass2"),
                 },
             },
         },
 
         -- ═══════════════════════════════════════════════════════════
-        -- SELECTION SETTINGS
+        -- SCORING SETTINGS
         -- ═══════════════════════════════════════════════════════════
         f:group_box {
-            title           = "Selection",
+            title           = "Scoring",
             fill_horizontal = 1,
 
+            -- Input quality (nitpicky scale)
             f:row {
                 f:static_text {
-                    title     = "Target count:",
+                    title     = "Input quality:",
+                    width     = LrView.share("run_label_width"),
+                    alignment = "right",
+                },
+                f:radio_button {
+                    title         = "Consumer",
+                    value         = LrView.bind("nitpickyScale"),
+                    checked_value = "consumer",
+                },
+                f:radio_button {
+                    title         = "Enthusiast",
+                    value         = LrView.bind("nitpickyScale"),
+                    checked_value = "enthusiast",
+                },
+                f:radio_button {
+                    title         = "Professional",
+                    value         = LrView.bind("nitpickyScale"),
+                    checked_value = "professional",
+                },
+            },
+            f:row {
+                f:static_text {
+                    title = "",
+                    width = LrView.share("run_label_width"),
+                },
+                f:static_text {
+                    title      = "Sets scoring expectations. Consumer = generous, Professional = discriminating.",
+                    text_color = LrView.kDisabledColor,
+                },
+            },
+
+            -- Target count
+            f:row {
+                f:static_text {
+                    title     = "Target:",
                     width     = LrView.share("run_label_width"),
                     alignment = "right",
                 },
@@ -194,67 +254,57 @@ local function showRunDialog(context)
                     value          = LrView.bind("targetCount"),
                     width_in_chars = 5,
                 },
-                f:static_text { title = "photos to select" },
+                f:static_text { title = "photos" },
             },
+
+            -- Emphasis slider
             f:row {
                 f:static_text {
-                    title     = "Technical emphasis:",
+                    title     = "Emphasis:",
                     width     = LrView.share("run_label_width"),
                     alignment = "right",
                 },
-                f:edit_field {
-                    value          = LrView.bind("technicalPct"),
-                    width_in_chars = 4,
+                f:static_text { title = "Technical" },
+                f:slider {
+                    value   = LrView.bind("emphasisSlider"),
+                    min     = 0,
+                    max     = 100,
+                    width   = 200,
                 },
-                f:static_text { title = "%" },
+                f:static_text { title = "Creative" },
                 f:static_text {
-                    title      = LrView.bind {
-                        key = "technicalPct",
-                        transform = function(value)
-                            local pct = tonumber(value) or 40
-                            return string.format("(%d%% technical, %d%% aesthetic)", pct, 100 - pct)
-                        end,
-                    },
+                    title      = LrView.bind("emphasisLabel"),
                     text_color = LrView.kDisabledColor,
+                    width_in_chars = 18,
                 },
             },
-            f:row {
-                f:static_text {
-                    title = "",
-                    width = LrView.share("run_label_width"),
-                },
-                f:static_text {
-                    title      = "How much to weight technical quality vs. aesthetic appeal. Default: 40%.",
-                    text_color = LrView.kDisabledColor,
-                },
-            },
-            -- Variety mode (Best Of only)
-            f:row {
-                visible = LrView.bind {
-                    key   = "selectionMode",
-                    transform = function(value) return value == "bestof" end,
-                },
-                f:static_text {
-                    title     = "Variety mode:",
-                    width     = LrView.share("run_label_width"),
-                    alignment = "right",
-                },
-                f:popup_menu {
-                    value = LrView.bind("varietyMode"),
-                    items = {
-                        { title = "Proportional (match original mix)",  value = "proportional" },
-                        { title = "Equal (balance across categories)",  value = "equal"        },
-                    },
-                },
-            },
+
+            -- Skip already scored
             f:row {
                 f:static_text {
                     title = "",
                     width = LrView.share("run_label_width"),
                 },
                 f:checkbox {
-                    title = "Calibrate scores to this collection (samples photos first)",
-                    value = LrView.bind("enableCalibration"),
+                    title = "Skip already-scored photos",
+                    value = LrView.bind("skipScored"),
+                },
+            },
+
+            -- Batch size override (advanced)
+            f:row {
+                f:static_text {
+                    title     = "Batch size:",
+                    width     = LrView.share("run_label_width"),
+                    alignment = "right",
+                },
+                f:edit_field {
+                    value          = LrView.bind("batchSize"),
+                    width_in_chars = 4,
+                },
+                f:static_text {
+                    title      = "(0 = auto)",
+                    text_color = LrView.kDisabledColor,
                 },
             },
         },
@@ -297,9 +347,9 @@ local function showRunDialog(context)
         if not target or target < 1 then
             return false, "Target count must be a positive number."
         end
-        local pct = tonumber(values.technicalPct)
-        if not pct or pct < 0 or pct > 100 then
-            return false, "Technical emphasis must be between 0 and 100."
+        local bs = tonumber(values.batchSize)
+        if bs and bs < 0 then
+            return false, "Batch size must be 0 (auto) or a positive number."
         end
         if photoCount == 0 then
             return false, "No photos selected. Select photos in the Library grid first."
@@ -318,7 +368,7 @@ local function showRunDialog(context)
         actionBinding = {
             enabled = {
                 bind_to_object = props,
-                keys = { "targetCount", "technicalPct" },
+                keys = { "targetCount", "batchSize" },
                 operation = function(_, values)
                     local isValid, validMsg = validateRunSettings(values)
                     props.validationMessage = validMsg
@@ -332,188 +382,31 @@ local function showRunDialog(context)
 
     -- Save run dialog settings back to prefs
     local prefs = LrPrefs.prefsForPlugin()
-    prefs.selectionMode         = props.selectionMode
-    prefs.targetCount           = math.floor(tonumber(props.targetCount))
-    prefs.technicalPct          = math.floor(tonumber(props.technicalPct))
-    prefs.varietyMode            = props.varietyMode
-    prefs.storyPreset           = props.storyPreset
+    prefs.selectionMode          = props.selectionMode
+    prefs.targetCount            = math.floor(tonumber(props.targetCount))
+    prefs.emphasisSlider         = math.floor(props.emphasisSlider)
+    prefs.nitpickyScale          = props.nitpickyScale
+    prefs.storyPreset            = props.storyPreset
     prefs.storyCustomInstructions = props.storyCustomInstructions
-    prefs.enableCalibration       = props.enableCalibration
+    prefs.enablePass2            = props.enablePass2
+    prefs.skipScored             = props.skipScored
+    prefs.batchSize              = math.floor(tonumber(props.batchSize) or 0)
 
-    -- Return overrides for the selection pass
+    -- Return overrides for scoring and selection passes
     return {
-        selectionMode         = props.selectionMode,
-        targetCount           = math.floor(tonumber(props.targetCount)),
-        technicalPct          = math.floor(tonumber(props.technicalPct)),
-        varietyMode            = props.varietyMode,
-        storyPreset           = props.storyPreset,
+        selectionMode          = props.selectionMode,
+        targetCount            = math.floor(tonumber(props.targetCount)),
+        emphasisSlider         = math.floor(props.emphasisSlider),
+        nitpickyScale          = props.nitpickyScale,
+        storyPreset            = props.storyPreset,
         storyCustomInstructions = props.storyCustomInstructions,
-        enableCalibration       = props.enableCalibration,
+        enablePass2            = props.enablePass2,
+        skipScored             = props.skipScored,
+        batchSize              = math.floor(tonumber(props.batchSize) or 0),
     }
 end
 
--- ── Calibration results dialog ──────────────────────────────────────────
--- Shows calibration stats and lets user adjust technical/aesthetic weight.
--- Returns updated technicalPct or nil if canceled.
-local function showCalibrationDialog(context, calStats, currentTechnicalPct)
-    local f = LrView.osFactory()
-    local props = LrBinding.makePropertyTable(context)
-
-    props.technicalPct = tostring(currentTechnicalPct)
-
-    local contents = f:column {
-        spacing         = f:dialog_spacing(),
-        fill_horizontal = 1,
-        bind_to_object  = props,
-
-        f:static_text {
-            title = string.format("Sampled %d of your photos to establish a scoring baseline.",
-                calStats.sampleCount),
-        },
-
-        f:separator { fill_horizontal = 1 },
-
-        -- Per-dimension stats
-        f:row {
-            f:static_text {
-                title     = "Technical scores:",
-                width     = LrView.share("cal_label_width"),
-                alignment = "right",
-            },
-            f:static_text {
-                title = string.format("%d — %d  (mean %.1f)",
-                    calStats.techMin, calStats.techMax, calStats.techMean),
-            },
-        },
-        f:row {
-            f:static_text {
-                title     = "Aesthetic scores:",
-                width     = LrView.share("cal_label_width"),
-                alignment = "right",
-            },
-            f:static_text {
-                title = string.format("%d — %d  (mean %.1f)",
-                    calStats.aestMin, calStats.aestMax, calStats.aestMean),
-            },
-        },
-        f:row {
-            f:static_text {
-                title     = "Combined range:",
-                width     = LrView.share("cal_label_width"),
-                alignment = "right",
-            },
-            f:static_text {
-                title = string.format("%d — %d  (mean %.1f, stddev %.1f)",
-                    calStats.min, calStats.max, calStats.mean, calStats.stddev),
-            },
-        },
-
-        f:separator { fill_horizontal = 1 },
-
-        -- Best/worst samples
-        f:row {
-            f:static_text {
-                title     = "Best sample:",
-                width     = LrView.share("cal_label_width"),
-                alignment = "right",
-            },
-            f:static_text {
-                title = string.format("\"%s\" (scored %d/10)",
-                    calStats.bestContent:sub(1, 60), calStats.max),
-            },
-        },
-        f:row {
-            f:static_text {
-                title     = "Weakest sample:",
-                width     = LrView.share("cal_label_width"),
-                alignment = "right",
-            },
-            f:static_text {
-                title = string.format("\"%s\" (scored %d/10)",
-                    calStats.worstContent:sub(1, 60), calStats.min),
-            },
-        },
-
-        f:separator { fill_horizontal = 1 },
-
-        -- Adjustable weight
-        f:row {
-            f:static_text {
-                title     = "Technical emphasis:",
-                width     = LrView.share("cal_label_width"),
-                alignment = "right",
-            },
-            f:edit_field {
-                value          = LrView.bind("technicalPct"),
-                width_in_chars = 4,
-            },
-            f:static_text { title = "%" },
-            f:static_text {
-                title      = LrView.bind {
-                    key = "technicalPct",
-                    transform = function(value)
-                        local pct = tonumber(value) or 40
-                        return string.format("(%d%% technical, %d%% aesthetic)", pct, 100 - pct)
-                    end,
-                },
-                text_color = LrView.kDisabledColor,
-            },
-        },
-        f:row {
-            f:static_text {
-                title = "",
-                width = LrView.share("cal_label_width"),
-            },
-            f:static_text {
-                title      = "Adjust based on the calibration results above.\nHigher = favor sharper images. Lower = favor more visually compelling images.",
-                text_color = LrView.kDisabledColor,
-                height_in_lines = 2,
-            },
-        },
-
-        -- Validation
-        f:row {
-            f:static_text {
-                title = "",
-                width = LrView.share("cal_label_width"),
-            },
-            f:static_text {
-                title           = LrView.bind("validationMessage"),
-                text_color      = LrView.kWarningColor,
-                fill_horizontal = 1,
-            },
-        },
-    }
-
-    props.validationMessage = ""
-
-    local result = LrDialogs.presentModalDialog {
-        title      = "AI Selects - Calibration Results",
-        contents   = contents,
-        actionVerb = "Continue Scoring",
-        actionBinding = {
-            enabled = {
-                bind_to_object = props,
-                keys = { "technicalPct" },
-                operation = function(_, values)
-                    local pct = tonumber(values.technicalPct)
-                    if not pct or pct < 0 or pct > 100 then
-                        props.validationMessage = "Technical emphasis must be between 0 and 100."
-                        return false
-                    end
-                    props.validationMessage = ""
-                    return true
-                end,
-            },
-        },
-    }
-
-    if result ~= "ok" then return nil end
-
-    return math.floor(tonumber(props.technicalPct))
-end
-
--- ── Main execution ──────────────────────────────────────────────────────
+-- ── Main execution ────────────────────────────────────────────────────────
 
 -- Signal to ScorePhotos/SelectPhotos: return module, don't start standalone task
 _G._AI_SELECTS_MODULE_LOAD = true
@@ -525,52 +418,31 @@ _G._AI_SELECTS_MODULE_LOAD = nil  -- clean up
 
 LrTasks.startAsyncTask(function()
     LrFunctionContext.callWithContext("AISelectsScoreAndSelect", function(context)
-        local ok, err = LrTasks.pcall(function()
 
-            -- Show run config dialog
-            local overrides = showRunDialog(context)
-            if not overrides then return end  -- user canceled
+        -- Show run config dialog
+        local overrides = showRunDialog(context)
+        if not overrides then return end  -- user canceled
 
-            -- Calibration pass (if enabled)
-            local calResult = ScoreModule.runCalibration(context)
-            if not calResult then return end  -- canceled or error
+        -- Pass 1: Score (batch scoring with snapshots)
+        local successCount, errorCount, skipCount, scoreSummary, allSnapshots =
+            ScoreModule.runScoring(context, overrides)
 
-            if calResult.calibrationStats then
-                -- Show calibration results and let user adjust weights
-                local newPct = showCalibrationDialog(
-                    context, calResult.calibrationStats, overrides.technicalPct)
-                if not newPct then return end  -- user canceled
-                overrides.technicalPct = newPct
-                -- Save updated weight to prefs
-                local prefs = LrPrefs.prefsForPlugin()
-                prefs.technicalPct = newPct
-            end
-
-            -- Pass 1: Score (with calibration result, skips re-calibration)
-            local successCount, errorCount, skipCount, scoreSummary =
-                ScoreModule.runScoring(context, calResult)
-
-            if not scoreSummary then
-                return  -- user canceled or no photos
-            end
-
-            LrDialogs.message("AI Selects - Scoring Complete", scoreSummary, "info")
-
-            if successCount == 0 and skipCount == 0 then
-                return  -- nothing scored and nothing previously scored
-            end
-
-            -- Pass 2: Select (with overrides from run dialog)
-            local selectSummary = SelectModule.runSelection(context, overrides)
-
-            if selectSummary then
-                LrDialogs.message("AI Selects - Selection Complete", selectSummary, "info")
-            end
-
-        end)
-        if not ok then
-            LrDialogs.message("AI Selects - Error",
-                "An unexpected error occurred:\n\n" .. tostring(err), "critical")
+        if not scoreSummary then
+            return  -- user canceled or no photos
         end
+
+        LrDialogs.message("AI Selects - Scoring Complete", scoreSummary, "info")
+
+        if successCount == 0 and skipCount == 0 then
+            return  -- nothing scored and nothing previously scored
+        end
+
+        -- Pass 2: Select (with overrides and snapshots from scoring)
+        local selectSummary = SelectModule.runSelection(context, overrides, allSnapshots)
+
+        if selectSummary then
+            LrDialogs.message("AI Selects - Selection Complete", selectSummary, "info")
+        end
+
     end)
 end)

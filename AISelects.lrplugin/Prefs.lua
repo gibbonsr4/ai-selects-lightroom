@@ -24,15 +24,17 @@ local DEFAULTS = {
     -- Selection
     selectionMode      = "bestof",
     targetCount        = 40,
-    technicalPct       = 40,   -- percentage (0-100); aesthetic = 100 - technicalPct
-    varietyMode         = "proportional",
+    emphasisSlider     = 50,    -- 0 = full technical, 100 = full creative
     renderSize         = 512,
     burstThresholdSecs = 2,
     skipScored         = false,
-    enableCalibration  = true,
+    -- Scoring
+    nitpickyScale      = "consumer",   -- "consumer", "enthusiast", "professional"
+    batchSize          = 0,            -- 0 = auto (provider default), or user override
     -- Story mode
     storyPreset            = "family_vacation",
     storyCustomInstructions = "",
+    enablePass2        = false,         -- Pass 2 refinement for story mode
     -- Logging
     enableLogging      = false,
     logFolder          = "",
@@ -74,14 +76,15 @@ local function getPrefs()
         timeoutSecs        = numPref(prefs, "timeoutSecs"),
         selectionMode      = stringPref(prefs, "selectionMode"),
         targetCount        = numPref(prefs, "targetCount"),
-        technicalPct       = numPref(prefs, "technicalPct"),
-        varietyMode         = stringPref(prefs, "varietyMode"),
+        emphasisSlider     = numPref(prefs, "emphasisSlider"),
         renderSize         = numPref(prefs, "renderSize"),
         burstThresholdSecs = numPref(prefs, "burstThresholdSecs"),
         skipScored         = boolPref(prefs, "skipScored"),
-        enableCalibration  = boolPref(prefs, "enableCalibration"),
+        nitpickyScale      = stringPref(prefs, "nitpickyScale"),
+        batchSize          = numPref(prefs, "batchSize"),
         storyPreset            = stringPref(prefs, "storyPreset"),
         storyCustomInstructions = stringPref(prefs, "storyCustomInstructions", true),
+        enablePass2        = boolPref(prefs, "enablePass2"),
         enableLogging      = boolPref(prefs, "enableLogging"),
         logFolder          = stringPref(prefs, "logFolder", true),
     }

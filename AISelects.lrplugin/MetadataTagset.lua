@@ -21,21 +21,27 @@ return {
 
         'com.adobe.separator',
 
-        -- AI Selects scores
-        { 'com.sonoranstrategy.ai-selects.aiSelectsTechnical',     label = 'Technical Score'  },
-        { 'com.sonoranstrategy.ai-selects.aiSelectsAesthetic',     label = 'Aesthetic Score'  },
+        -- AI Selects scores (v2: 4 dimensions + composite)
+        { 'com.sonoranstrategy.ai-selects.aiSelectsComposite',    label = 'Composite Score'   },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsTechnical',    label = 'Technical'         },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsComposition',  label = 'Composition'       },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsEmotion',      label = 'Emotion'           },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsMoment',       label = 'Moment'            },
+
+        'com.adobe.separator',
+
+        -- Descriptive fields
         { 'com.sonoranstrategy.ai-selects.aiSelectsContent',       label = 'Content'          },
         { 'com.sonoranstrategy.ai-selects.aiSelectsCategory',      label = 'Category'         },
-        { 'com.sonoranstrategy.ai-selects.aiSelectsReject',        label = 'Reject'           },
-        { 'com.sonoranstrategy.ai-selects.aiSelectsPhash',         label = 'Perceptual Hash'  },
-        { 'com.sonoranstrategy.ai-selects.aiSelectsScoreDate',     label = 'Score Date'       },
-        { 'com.sonoranstrategy.ai-selects.aiSelectsEyeQuality',    label = 'Eye Quality'      },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsEyeQuality',   label = 'Eye Quality'      },
         { 'com.sonoranstrategy.ai-selects.aiSelectsNarrativeRole', label = 'Narrative Role'   },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsReject',        label = 'Reject'           },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsScoreDate',     label = 'Score Date'       },
 
         'com.adobe.separator',
 
         -- Story mode fields (populated during narrative selection)
-        { 'com.sonoranstrategy.ai-selects.aiSelectsSequence',      label = 'Sequence'         },
-        { 'com.sonoranstrategy.ai-selects.aiSelectsStoryNote',     label = 'Story Note'       },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsSequence',     label = 'Sequence'          },
+        { 'com.sonoranstrategy.ai-selects.aiSelectsStoryNote',    label = 'Story Note'        },
     },
 }

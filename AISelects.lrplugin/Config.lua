@@ -522,7 +522,7 @@ LrTasks.startAsyncTask(function()
                         value          = LrView.bind("timeoutSecs"),
                         width_in_chars = 5,
                     },
-                    f:static_text { title = "seconds per image" },
+                    f:static_text { title = "seconds per batch" },
                 },
                 f:row {
                     f:static_text {

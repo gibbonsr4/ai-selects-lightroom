@@ -1,17 +1,20 @@
 --[[
   ScorePhotos.lua
-  ─────────────────────────────────────────────────────────────────────────────
-  Pass 1: Iterates over selected Lightroom Classic photos, renders each one,
-  sends to Ollama or Claude API for scoring, and writes scores to custom
-  metadata fields.
+  ---------------------------------------------------------------------------
+  Pass 1: Batch scoring pipeline.
 
-  Can be invoked directly (as a menu item) or via ScoreAndSelect.lua
-  which calls the exported runScoring(context) function.
+  Sorts selected photos chronologically, forms batches, sends multi-image
+  API calls with carryover anchors, writes 4-dimension scores + metadata,
+  extracts story snapshots.
 
-  macOS only. Settings via Library > Plugin Extras > Settings...
+  Can be invoked directly (menu item) or via ScoreAndSelect.lua which
+  calls the exported runScoring(context, config) function.
+
+  v2: Replaces single-image scoring with relative batch ranking.
+  macOS only.
 --]]
 
--- ── LR SDK imports ─────────────────────────────────────────────────────────
+-- == LR SDK imports ===========================================================
 local LrApplication     = import 'LrApplication'
 local LrDate            = import 'LrDate'
 local LrDialogs         = import 'LrDialogs'
@@ -20,10 +23,11 @@ local LrPathUtils       = import 'LrPathUtils'
 local LrProgressScope   = import 'LrProgressScope'
 local LrTasks           = import 'LrTasks'
 
-local Engine = dofile(_PLUGIN.path .. '/AIEngine.lua')
-local Prefs  = dofile(_PLUGIN.path .. '/Prefs.lua')
+local Engine        = dofile(_PLUGIN.path .. '/AIEngine.lua')
+local Prefs         = dofile(_PLUGIN.path .. '/Prefs.lua')
+local BatchStrategy = dofile(_PLUGIN.path .. '/BatchStrategy.lua')
 
--- ── Logger ────────────────────────────────────────────────────────────────
+-- == Logger ===================================================================
 -- Writes incrementally so crash mid-run still captures everything up to that point.
 local Logger = {}
 
@@ -60,8 +64,9 @@ function Logger:init(settings)
     end
     self.fileHandle = fh
 
-    self:log("═══════════════════════════════════════════════════════════")
-    self:log("AI Selects - Scoring started at " .. LrDate.timeToUserFormat(self.startTime, "%Y-%m-%d %H:%M:%S"))
+    self:log("===================================================================")
+    self:log("AI Selects v2 - Batch Scoring started at "
+        .. LrDate.timeToUserFormat(self.startTime, "%Y-%m-%d %H:%M:%S"))
     self:log("Provider: " .. settings.provider)
     if settings.provider == "ollama" then
         self:log("Model: " .. settings.model)
@@ -74,9 +79,10 @@ function Logger:init(settings)
         self:log("Model: " .. settings.geminiModel)
     end
     self:log("Render size: " .. tostring(settings.renderSize) .. "px")
+    self:log("Nitpicky scale: " .. tostring(settings.nitpickyScale))
+    self:log("Batch size: " .. tostring(BatchStrategy.getBatchSize(settings.provider, settings.batchSize)))
     self:log("Skip scored: " .. tostring(settings.skipScored))
-    self:log("Calibration: " .. tostring(settings.enableCalibration))
-    self:log("═══════════════════════════════════════════════════════════")
+    self:log("===================================================================")
 end
 
 function Logger:_writeRaw(text)
@@ -93,24 +99,18 @@ function Logger:log(message)
     self:_writeRaw(line)
 end
 
-function Logger:logImage(filename, result, detail)
+function Logger:logBatch(batchNum, totalBatches, photoCount, detail)
     if not self.enabled then return end
-    if result == "success" then
-        self:log("[OK]    " .. filename .. "  ->  " .. detail)
-    elseif result == "skipped" then
-        self:log("[SKIP]  " .. filename .. "  ->  " .. detail)
-    else
-        self:log("[FAIL]  " .. filename .. "  ->  " .. detail)
-    end
+    self:log(string.format("[Batch %d/%d] %d photos  %s", batchNum, totalBatches, photoCount, detail))
 end
 
-function Logger:finish(successCount, errorCount, skippedCount)
+function Logger:finish(successCount, errorCount, skippedCount, batchCount)
     if not self.enabled then return end
     local elapsed = LrDate.currentTime() - self.startTime
-    self:log("═══════════════════════════════════════════════════════════")
-    self:log(string.format("Run complete - %d scored, %d errors, %d skipped (%.0fs elapsed)",
-        successCount, errorCount, skippedCount, elapsed))
-    self:log("═══════════════════════════════════════════════════════════")
+    self:log("===================================================================")
+    self:log(string.format("Run complete - %d scored in %d batches, %d errors, %d skipped (%.0fs elapsed)",
+        successCount, batchCount or 0, errorCount, skippedCount, elapsed))
+    self:log("===================================================================")
 
     if self.fileHandle then
         self.fileHandle:close()
@@ -118,50 +118,20 @@ function Logger:finish(successCount, errorCount, skippedCount)
     end
 end
 
--- ── Query and score a single photo ──────────────────────────────────────
-local function scorePhoto(photo, settings, imageIndex, promptOverride)
-    local ts = tostring(math.floor(LrDate.currentTime() * 1000)) .. "_" .. tostring(imageIndex or 0)
-
-    local img, err = Engine.prepareImage(photo, ts, settings.provider, settings.renderSize)
-    if not img then return nil, nil, err end
-
-    local prompt = promptOverride or Engine.SCORING_PROMPT
-
-    local raw
-    if settings.provider == "claude" then
-        raw, err = Engine.queryClaude(img, prompt, settings.claudeModel,
-            settings.claudeApiKey, settings.timeoutSecs)
-    elseif settings.provider == "openai" then
-        raw, err = Engine.queryOpenAI(img, prompt, settings.openaiModel,
-            settings.openaiApiKey, settings.timeoutSecs)
-    elseif settings.provider == "gemini" then
-        raw, err = Engine.queryGemini(img, prompt, settings.geminiModel,
-            settings.geminiApiKey, settings.timeoutSecs)
-    else
-        raw, err = Engine.queryOllama(img, prompt, settings.model,
-            settings.ollamaUrl, settings.timeoutSecs)
-    end
-
-    if not raw then return nil, nil, err end
-
-    local scores, parseErr = Engine.parseScoreResponse(raw)
-    if not scores then
-        return nil, raw, parseErr
-    end
-
-    return scores, raw, nil
-end
-
--- ── Write scores to custom metadata ────────────────────────────────────
-local function writeScores(catalog, photo, scores, phash, filename)
+-- == Write scores to custom metadata ==========================================
+-- Writes all 4 dimensions + composite + descriptive fields for one photo.
+local function writeScores(catalog, photo, scores, composite, phash, batchId, filename)
     local writeResult = catalog:withWriteAccessDo(
         "AI Selects - Score " .. filename,
         function()
-            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsTechnical',  tostring(scores.technical))
-            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsAesthetic',  tostring(scores.aesthetic))
-            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsContent',    scores.content)
-            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsCategory',   scores.dominated_by)
-            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsReject',     tostring(scores.reject))
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsTechnical',    tostring(scores.technical))
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsComposition',  tostring(scores.composition))
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsEmotion',      tostring(scores.emotion))
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsMoment',       tostring(scores.moment))
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsComposite',    string.format("%.1f", composite))
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsContent',      scores.content)
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsCategory',     scores.category)
+            photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsReject',       tostring(scores.reject))
             if scores.eye_quality then
                 photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsEyeQuality', scores.eye_quality)
             end
@@ -169,7 +139,10 @@ local function writeScores(catalog, photo, scores, phash, filename)
                 photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsNarrativeRole', scores.narrative_role)
             end
             if phash then
-                photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsPhash',  phash)
+                photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsPhash', phash)
+            end
+            if batchId then
+                photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsBatchId', tostring(batchId))
             end
             photo:setPropertyForPlugin(_PLUGIN, 'aiSelectsScoreDate',
                 LrDate.timeToUserFormat(LrDate.currentTime(), "%Y-%m-%d %H:%M:%S"))
@@ -179,101 +152,16 @@ local function writeScores(catalog, photo, scores, phash, filename)
     return writeResult
 end
 
--- ── Calibration helpers ───────────────────────────────────────────────
-
--- Sample photos evenly distributed across the capture timeline.
--- Returns an array of indices into the photos array.
-local function sampleCalibrationPhotos(photos, sampleCount)
-    if #photos <= sampleCount then
-        local indices = {}
-        for i = 1, #photos do indices[i] = i end
-        return indices
-    end
-
-    -- Build (index, captureTime) pairs and sort by capture time
-    local timed = {}
-    for i, photo in ipairs(photos) do
-        local captureTime = photo:getRawMetadata('dateTimeOriginal')
-        timed[#timed + 1] = { idx = i, time = captureTime or 0 }
-    end
-    table.sort(timed, function(a, b) return a.time < b.time end)
-
-    -- Pick evenly spaced indices from the sorted timeline
-    local indices = {}
-    local step = #timed / sampleCount
-    for s = 0, sampleCount - 1 do
-        local pos = math.floor(s * step + step / 2) + 1
-        pos = math.min(pos, #timed)
-        indices[#indices + 1] = timed[pos].idx
-    end
-
-    return indices
-end
-
--- Compute calibration statistics from an array of score tables.
--- Returns stats table for buildCalibratedPrompt() and calibration dialog,
--- or nil if insufficient data.
-local function computeCalibrationStats(scoredResults)
-    if #scoredResults < 2 then return nil end
-
-    -- Use composite score (average of technical + aesthetic) for distribution
-    local composites = {}
-    for _, s in ipairs(scoredResults) do
-        composites[#composites + 1] = {
-            composite = (s.technical + s.aesthetic) / 2,
-            content = s.content or "unknown",
-        }
-    end
-
-    table.sort(composites, function(a, b) return a.composite < b.composite end)
-
-    local sum, sumSq = 0, 0
-    local minVal, maxVal = 10, 1
-    -- Per-dimension tracking
-    local techMin, techMax, techSum = 10, 1, 0
-    local aestMin, aestMax, aestSum = 10, 1, 0
-
-    for i, c in ipairs(composites) do
-        local v = c.composite
-        sum = sum + v
-        sumSq = sumSq + v * v
-        if v < minVal then minVal = v end
-        if v > maxVal then maxVal = v end
-    end
-
-    for _, s in ipairs(scoredResults) do
-        if s.technical < techMin then techMin = s.technical end
-        if s.technical > techMax then techMax = s.technical end
-        techSum = techSum + s.technical
-        if s.aesthetic < aestMin then aestMin = s.aesthetic end
-        if s.aesthetic > aestMax then aestMax = s.aesthetic end
-        aestSum = aestSum + s.aesthetic
-    end
-
-    local n = #composites
-    local mean = sum / n
-    local variance = (sumSq / n) - (mean * mean)
-    local stddev = math.sqrt(math.max(0, variance))
-
-    return {
-        -- Composite stats (used by buildCalibratedPrompt)
-        min = math.floor(minVal + 0.5),
-        max = math.floor(maxVal + 0.5),
-        mean = mean,
-        stddev = stddev,
-        bestContent = composites[n].content,
-        worstContent = composites[1].content,
-        sampleCount = n,
-        -- Per-dimension stats (used by calibration dialog)
-        techMin = techMin, techMax = techMax, techMean = techSum / n,
-        aestMin = aestMin, aestMax = aestMax, aestMean = aestSum / n,
-    }
-end
-
--- ── Shared setup: validate photos, API keys, filter file types ────────
+-- == Shared setup: validate photos, API keys, filter file types ===============
 -- Returns (SETTINGS, catalog, toProcess, skipped) or nil on error/cancel.
-local function validateAndPrepare()
+local function validateAndPrepare(configOverride)
     local SETTINGS = Prefs.getPrefs()
+    -- Merge run dialog overrides on top of full settings
+    if configOverride then
+        for k, v in pairs(configOverride) do
+            SETTINGS[k] = v
+        end
+    end
     local catalog      = LrApplication.activeCatalog()
     local targetPhotos = catalog:getTargetPhotos()
 
@@ -305,9 +193,9 @@ local function validateAndPrepare()
     for _, photo in ipairs(targetPhotos) do
         local path = photo:getRawMetadata('path')
         if Engine.SUPPORTED_EXTS[Engine.getExt(path)] then
-            table.insert(toProcess, photo)
+            toProcess[#toProcess + 1] = photo
         else
-            table.insert(skipped, LrPathUtils.leafName(path))
+            skipped[#skipped + 1] = LrPathUtils.leafName(path)
         end
     end
 
@@ -320,14 +208,12 @@ local function validateAndPrepare()
     end
 
     -- Clean up orphaned temp files from interrupted runs
-    pcall(function()
-        LrTasks.execute("rm -f /tmp/ai_sel_req_* /tmp/ai_sel_resp_* /tmp/ai_sel_cfg_* 2>/dev/null")
-    end)
+    LrTasks.execute("rm -f /tmp/ai_sel_req_* /tmp/ai_sel_resp_* /tmp/ai_sel_cfg_* 2>/dev/null")
 
     return SETTINGS, catalog, toProcess, skipped
 end
 
--- ── Resolve provider display info ────────────────────────────────────
+-- == Provider display info ====================================================
 local function getProviderInfo(SETTINGS)
     local modelName
     if SETTINGS.provider == "claude" then
@@ -344,365 +230,365 @@ local function getProviderInfo(SETTINGS)
         gemini = "Gemini API", ollama = "Ollama",
     }
     local providerLabel = providerLabels[SETTINGS.provider] or "Ollama"
-    return providerLabel, modelName
+    return providerLabel, modelName or "unknown"
 end
 
--- ── Calibration pass ─────────────────────────────────────────────────
--- Runs setup, validation, and calibration phase.
--- Returns a result table for runScoring(), or nil on error/cancel.
--- Result table: { calibrationStats, calibratedPrompt, calibratedSet,
---   toProcess, skipped, log, SETTINGS, catalog, providerLabel, modelName,
---   calSuccessCount, calSkippedScored, calErrorLog }
-local function runCalibration(context)
-    local SETTINGS, catalog, toProcess, skipped = validateAndPrepare()
+-- == Core batch scoring logic =================================================
+-- @param context       LrFunctionContext
+-- @param config        Optional settings override (from ScoreAndSelect.lua)
+-- @return (successCount, errorCount, skippedCount, summary, snapshots) or nil
+local function runScoring(context, config)
+    local SETTINGS, catalog, toProcess, skipped = validateAndPrepare(config)
     if not SETTINGS then return nil end
 
     local providerLabel, modelName = getProviderInfo(SETTINGS)
+    local provider = SETTINGS.provider
+    local includeSnapshots = BatchStrategy.supportsSnapshots(provider)
+    local weights = BatchStrategy.computeWeights(SETTINGS.emphasisSlider)
 
     -- Initialize logger
     local log = setmetatable({}, { __index = Logger })
     log:init(SETTINGS)
-    log:log("Scoring prompt: " .. Engine.SCORING_PROMPT)
 
-    local calibratedPrompt = nil
-    local calibratedSet = {}
-    local calibrationStats = nil
-    local calScores = {}
-    local successCount = 0
+    -- Filter already-scored photos if skipScored is enabled
+    local photosToScore = {}
     local skippedScored = 0
-    local errorLog = {}
-
-    if SETTINGS.enableCalibration and #toProcess >= 10 then
-        local progress = LrProgressScope({
-            title           = "AI Selects - Calibrating (" .. providerLabel .. " - " .. modelName .. ")",
-            functionContext = context,
-        })
-
-        local sampleSize = math.max(10, math.min(50, math.floor(#toProcess * 0.05)))
-        local sampleIndices = sampleCalibrationPhotos(toProcess, sampleSize)
-
-        log:log(string.format("Calibration: sampling %d of %d photos", #sampleIndices, #toProcess))
-
-        for ci, photoIdx in ipairs(sampleIndices) do
-            if progress:isCanceled() then
-                log:log("Calibration canceled by user")
-                progress:done()
-                log:finish(successCount, #errorLog, skippedScored)
-                return nil
+    for _, photo in ipairs(toProcess) do
+        if SETTINGS.skipScored then
+            local scoreDate = photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsScoreDate')
+            if scoreDate and scoreDate ~= "" then
+                skippedScored = skippedScored + 1
+                local fn = LrPathUtils.leafName(photo:getRawMetadata('path'))
+                log:log("[SKIP]  " .. fn .. "  ->  already scored on " .. scoreDate)
+            else
+                photosToScore[#photosToScore + 1] = photo
             end
-
-            local photo = toProcess[photoIdx]
-            local path = photo:getRawMetadata('path')
-            local filename = LrPathUtils.leafName(path)
-
-            progress:setPortionComplete(ci - 1, #sampleIndices)
-            progress:setCaption(string.format("Calibrating [%d/%d] %s",
-                ci, #sampleIndices, filename))
-
-            -- If skipScored is on, try to use existing scores for calibration
-            local alreadyScored = false
-            if SETTINGS.skipScored then
-                local scoreDate = photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsScoreDate')
-                if scoreDate and scoreDate ~= "" then
-                    local existingTech = tonumber(
-                        photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsTechnical'))
-                    local existingAest = tonumber(
-                        photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsAesthetic'))
-                    local existingContent =
-                        photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsContent')
-                    if existingTech and existingAest then
-                        calScores[#calScores + 1] = {
-                            technical = existingTech,
-                            aesthetic = existingAest,
-                            content = existingContent or "unknown",
-                        }
-                        calibratedSet[photoIdx] = true
-                        alreadyScored = true
-                        skippedScored = skippedScored + 1
-                        log:logImage(filename, "skipped",
-                            "calibration sample - using existing scores")
-                    end
-                end
-            end
-
-            if not alreadyScored then
-                local scores, rawResponse, err = scorePhoto(photo, SETTINGS, photoIdx)
-
-                if rawResponse then
-                    log:log(string.format("  Cal raw response: %s", rawResponse:sub(1, 500)))
-                end
-
-                if scores then
-                    local phash, phashErr = Engine.computePhash(photo,
-                        tostring(math.floor(LrDate.currentTime() * 1000))
-                        .. "_cal_" .. tostring(ci))
-                    if phashErr then
-                        log:log("  Phash warning: " .. phashErr)
-                    end
-
-                    LrTasks.yield()
-                    local writeOk, writeErr = LrTasks.pcall(function()
-                        local writeResult = writeScores(
-                            catalog, photo, scores, phash, filename)
-                        if writeResult ~= "executed" then
-                            error("Catalog write not executed (result: "
-                                .. tostring(writeResult) .. ")")
-                        end
-                    end)
-                    LrTasks.yield()
-
-                    if writeOk then
-                        calScores[#calScores + 1] = scores
-                        calibratedSet[photoIdx] = true
-                        successCount = successCount + 1
-                        log:logImage(filename, "success",
-                            string.format("Cal: Tech:%d Aest:%d %s",
-                                scores.technical, scores.aesthetic, scores.content))
-                    else
-                        table.insert(errorLog,
-                            "- " .. filename .. "\n  Cal write error: "
-                            .. tostring(writeErr))
-                        log:logImage(filename, "error",
-                            "Cal write failed: " .. tostring(writeErr))
-                    end
-                else
-                    table.insert(errorLog,
-                        "- " .. filename .. "\n  Cal: " .. (err or "unknown error"))
-                    log:logImage(filename, "error", "Cal: " .. (err or "unknown"))
-                end
-            end
-
-            LrTasks.sleep(0.05)
-        end
-
-        progress:setPortionComplete(1, 1)
-        progress:done()
-
-        -- Compute stats and build calibrated prompt
-        local calStats = computeCalibrationStats(calScores)
-        if calStats then
-            calibrationStats = calStats
-            calibratedPrompt = Engine.buildCalibratedPrompt(calStats)
-            log:log(string.format(
-                "Calibration complete: min=%d max=%d mean=%.1f stddev=%.1f best='%s' worst='%s'",
-                calStats.min, calStats.max, calStats.mean, calStats.stddev,
-                calStats.bestContent, calStats.worstContent))
-            log:log("Calibrated prompt: " .. calibratedPrompt:sub(1, 500))
         else
-            log:log("Calibration: insufficient data, using standard prompt")
+            photosToScore[#photosToScore + 1] = photo
         end
-    elseif SETTINGS.enableCalibration and #toProcess < 10 then
-        log:log("Calibration: skipped (fewer than 10 photos)")
     end
 
-    return {
-        calibrationStats  = calibrationStats,
-        calibratedPrompt  = calibratedPrompt,
-        calibratedSet     = calibratedSet,
-        calScores         = calScores,
-        toProcess         = toProcess,
-        skipped           = skipped,
-        log               = log,
-        SETTINGS          = SETTINGS,
-        catalog           = catalog,
-        providerLabel     = providerLabel,
-        modelName         = modelName,
-        calSuccessCount   = successCount,
-        calSkippedScored  = skippedScored,
-        calErrorLog       = errorLog,
+    if #photosToScore == 0 then
+        log:finish(0, 0, skippedScored, 0)
+        return 0, 0, skippedScored, "All photos already scored. Nothing to do."
+    end
+
+    -- Form chronological batches
+    local batches = BatchStrategy.formBatches(photosToScore, provider, SETTINGS.batchSize)
+    local totalBatches = #batches
+
+    log:log(string.format("Scoring %d photos in %d batches (batch size: %d)",
+        #photosToScore, totalBatches,
+        BatchStrategy.getBatchSize(provider, SETTINGS.batchSize)))
+
+    -- Track results
+    local successCount = 0
+    local errorLog = {}
+    local allSnapshots = {}  -- collected for story mode
+    local allScores = {      -- per-dimension arrays for distribution stats
+        technical = {}, composition = {}, emotion = {}, moment = {}, composite = {},
     }
-end
 
--- ── Core scoring logic ─────────────────────────────────────────────────
--- Exported so ScoreAndSelect.lua can call it within its own async context.
--- When calResult is provided (from runCalibration), skips setup/validation/calibration.
--- When calResult is nil, runs the full flow (standalone menu item).
--- Returns (successCount, errorCount, skippedCount, summary) or nil on error/cancel.
-local function runScoring(context, calResult)
-    -- Standalone mode: run calibration pass first
-    if not calResult then
-        calResult = runCalibration(context)
-        if not calResult then return nil end
-    end
+    -- Carryover state
+    local previousBatchScores = nil
+    local startTime = LrDate.currentTime()
 
-    local SETTINGS        = calResult.SETTINGS
-    local catalog         = calResult.catalog
-    local toProcess       = calResult.toProcess
-    local skipped         = calResult.skipped
-    local log             = calResult.log
-    local providerLabel   = calResult.providerLabel
-    local modelName       = calResult.modelName
-    local calibratedPrompt = calResult.calibratedPrompt
-    local calibratedSet   = calResult.calibratedSet
-    local calibrationStats = calResult.calibrationStats
-    local successCount    = calResult.calSuccessCount
-    local skippedScored   = calResult.calSkippedScored
-    local errorLog        = calResult.calErrorLog
-    local startTime       = LrDate.currentTime()
-
-    -- Score distribution tracking (post-calibration only; calibration scores kept separate)
-    local allTechnical, allAesthetic = {}, {}
-
-    -- ── Main scoring loop ──────────────────────────────────────────────
-
+    -- == Main batch loop ======================================================
     local progress = LrProgressScope({
         title           = "AI Selects (" .. providerLabel .. " - " .. modelName .. ")",
         functionContext = context,
     })
 
-    for i, photo in ipairs(toProcess) do
+    for batchIdx, batch in ipairs(batches) do repeat  -- repeat/until true = breakable block
         if progress:isCanceled() then
-            log:log("Run canceled by user at image " .. i)
+            log:log("Run canceled by user at batch " .. batchIdx)
             break
         end
 
-        -- Skip photos already scored during calibration
-        if calibratedSet[i] then
-            -- already counted in successCount during calibration
-        else
-
-        local path     = photo:getRawMetadata('path')
-        local filename = LrPathUtils.leafName(path)
-
-        progress:setPortionComplete(i - 1, #toProcess)
-
-        -- Skip already-scored photos
-        local shouldSkip = false
-        if SETTINGS.skipScored then
-            local scoreDate = photo:getPropertyForPlugin(_PLUGIN, 'aiSelectsScoreDate')
-            if scoreDate and scoreDate ~= "" then
-                skippedScored = skippedScored + 1
-                shouldSkip = true
-                log:logImage(filename, "skipped", "already scored on " .. scoreDate)
-            end
-        end
-
-        if not shouldSkip then
-
         -- ETA calculation
         local eta = ""
-        if successCount > 0 then
+        if batchIdx > 1 then
             local elapsed = LrDate.currentTime() - startTime
-            local avgTime = elapsed / (successCount + #errorLog)
-            local remaining = avgTime * (#toProcess - i)
-            eta = string.format(" - ~%d min remaining", math.ceil(remaining / 60))
+            local avgBatch = elapsed / (batchIdx - 1)
+            local remaining = avgBatch * (totalBatches - batchIdx + 1)
+            eta = string.format(" — ~%d min remaining", math.ceil(remaining / 60))
         end
 
-        progress:setCaption(string.format("[%d/%d] %s%s", i, #toProcess, filename, eta))
+        local firstPhoto = batchIdx == 1 and 1 or 0
+        local photoRangeStart = 0
+        for b = 1, batchIdx - 1 do photoRangeStart = photoRangeStart + #batches[b] end
+        photoRangeStart = photoRangeStart + 1
+        local photoRangeEnd = photoRangeStart + #batch - 1
 
-        -- Query AI model (use calibrated prompt if available)
-        local queryStart = LrDate.currentTime()
-        local scores, rawResponse, err = scorePhoto(photo, SETTINGS, i, calibratedPrompt)
-        local queryElapsed = LrDate.currentTime() - queryStart
+        progress:setPortionComplete(batchIdx - 1, totalBatches)
+        progress:setCaption(string.format("[Batch %d/%d] Scoring photos %d-%d%s",
+            batchIdx, totalBatches, photoRangeStart, photoRangeEnd, eta))
 
-        if rawResponse then
-            log:log(string.format("  Raw response: %s", rawResponse:sub(1, 500)))
-        end
-        log:log(string.format("  Query time: %.1fs", queryElapsed))
+        log:logBatch(batchIdx, totalBatches, #batch, "Starting")
 
-        if scores then
-            -- Compute perceptual hash for duplicate detection
-            local phash, phashErr = Engine.computePhash(photo,
-                tostring(math.floor(LrDate.currentTime() * 1000)) .. "_" .. tostring(i))
-            if phashErr then
-                log:log("  Phash warning: " .. phashErr)
+        -- 1. Prepare images for this batch
+        local images = {}
+        local imageLabels = {}
+        local photoIds = {}
+        local photoTimestamps = {}
+        -- Positional lookup: maps 1-based index in images array → { photo, filename }
+        local photoByPosition = {}
+        local renderErrors = {}
+
+        for i, photo in ipairs(batch) do
+            local path = photo:getRawMetadata('path')
+            local filename = LrPathUtils.leafName(path)
+            local id = tostring(photo.localIdentifier)
+            local captureTime = photo:getRawMetadata('dateTimeOriginal')
+            local timestamp = ""
+            if captureTime then
+                timestamp = LrDate.timeToUserFormat(captureTime, "%Y-%m-%d %H:%M:%S")
             end
 
-            -- Write scores + hash to catalog
-            LrTasks.yield()
-            local writeOk, writeErr = LrTasks.pcall(function()
-                local writeResult = writeScores(catalog, photo, scores, phash, filename)
-                if writeResult ~= "executed" then
-                    error("Catalog write not executed (result: " .. tostring(writeResult) .. ")")
+            local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+                .. "_b" .. batchIdx .. "_" .. i
+            local img, err = Engine.prepareImage(photo, ts, provider, SETTINGS.renderSize)
+
+            if img then
+                local pos = #images + 1
+                images[pos] = img
+                imageLabels[pos] = string.format("Photo %d of %d", pos, #batch)
+                photoIds[#photoIds + 1] = id
+                photoTimestamps[#photoTimestamps + 1] = timestamp
+                photoByPosition[pos] = { photo = photo, filename = filename, id = id }
+            else
+                renderErrors[#renderErrors + 1] = filename .. ": " .. (err or "render failed")
+                log:log("  [FAIL]  " .. filename .. "  ->  " .. (err or "render failed"))
+                errorLog[#errorLog + 1] = "- " .. filename .. "\n  " .. (err or "render failed")
+            end
+        end
+
+        if #images == 0 then
+            log:logBatch(batchIdx, totalBatches, #batch, "All renders failed, skipping")
+            break  -- skip to next batch
+        end
+
+        -- 2. Select carryover anchors from previous batch
+        local anchors = BatchStrategy.selectAnchors(previousBatchScores, provider)
+        local anchorImages = nil
+        local anchorLabels = nil
+
+        if #anchors > 0 and provider ~= "ollama" then
+            -- For cloud providers: render anchor images and include them
+            anchorImages = {}
+            anchorLabels = {}
+            for ai, anchor in ipairs(anchors) do
+                local ats = tostring(math.floor(LrDate.currentTime() * 1000))
+                    .. "_anc_" .. batchIdx .. "_" .. ai
+                local aImg, aErr = Engine.prepareImage(anchor.photo, ats, provider, SETTINGS.renderSize)
+                if aImg then
+                    anchorImages[#anchorImages + 1] = aImg
+                    anchorLabels[#anchorLabels + 1] = string.format(
+                        "ANCHOR %d (%s) — DO NOT SCORE. Prior: T=%d C=%d E=%d M=%d (%.1f)",
+                        ai, anchor.role,
+                        anchor.scores.technical, anchor.scores.composition,
+                        anchor.scores.emotion, anchor.scores.moment,
+                        anchor.composite
+                    )
+                else
+                    log:log(string.format("  Anchor %d render failed: %s", ai, aErr or "unknown"))
                 end
-            end)
+            end
+            if #anchorImages == 0 then
+                anchorImages = nil
+                anchorLabels = nil
+            end
+        end
+
+        -- 3. Build the scoring prompt
+        local prompt = Engine.buildBatchScoringPrompt(
+            photoIds, photoTimestamps, anchors,
+            SETTINGS.nitpickyScale, includeSnapshots
+        )
+
+        log:log(string.format("  Prompt length: %d chars, %d images + %d anchors",
+            #prompt, #images, anchorImages and #anchorImages or 0))
+
+        -- 4. Send batch API call
+        local queryStart = LrDate.currentTime()
+        local maxTokens = BatchStrategy.getMaxTokens(provider, "scoring")
+        local rawResponse, queryErr = Engine.queryBatch(
+            images, imageLabels, anchorImages, anchorLabels,
+            prompt, SETTINGS, maxTokens
+        )
+        local queryElapsed = LrDate.currentTime() - queryStart
+
+        log:log(string.format("  Query time: %.1fs", queryElapsed))
+
+        if not rawResponse then
+            log:logBatch(batchIdx, totalBatches, #batch, "API error: " .. (queryErr or "unknown"))
+            for pos = 1, #images do
+                local info = photoByPosition[pos]
+                if info then
+                    errorLog[#errorLog + 1] = "- " .. info.filename .. "\n  Batch API error: " .. (queryErr or "unknown")
+                end
+            end
+            break  -- skip to next batch
+        end
+
+        if log.enabled then
+            log:log("  Raw response (first 800): " .. rawResponse:sub(1, 800))
+        end
+
+        -- 5. Parse batch response (positional — no ID matching needed)
+        local batchScores, snapshot, parseErr = Engine.parseBatchResponse(rawResponse)
+
+        if not batchScores then
+            log:logBatch(batchIdx, totalBatches, #batch, "Parse error: " .. (parseErr or "unknown"))
+            for pos = 1, #images do
+                local info = photoByPosition[pos]
+                if info then
+                    errorLog[#errorLog + 1] = "- " .. info.filename .. "\n  Parse error: " .. (parseErr or "unknown")
+                end
+            end
+            break  -- skip to next batch
+        end
+
+        -- Validate score count matches photo count
+        if #batchScores ~= #images then
+            log:log(string.format("  Warning: got %d scores for %d photos", #batchScores, #images))
+        end
+
+        log:log(string.format("  Parsed %d scores%s",
+            #batchScores, snapshot and " + snapshot" or ""))
+
+        -- 6. Store snapshot (if present)
+        if snapshot then
+            snapshot.batchIndex = batchIdx
+            snapshot.photoIds = photoIds
+            -- Add time range from first/last photo in batch
+            if #photoTimestamps > 0 then
+                snapshot.timeRange = {
+                    start = photoTimestamps[1],
+                    finish = photoTimestamps[#photoTimestamps],
+                }
+            end
+            allSnapshots[#allSnapshots + 1] = snapshot
+            log:log("  Snapshot: " .. tostring(snapshot.scene or ""):sub(1, 100))
+        end
+
+        -- 7. Write scores to metadata — POSITIONAL mapping (score[i] → photo[i])
+        local batchScoreEntries = {}  -- for carryover anchor selection
+        local scoreCount = math.min(#batchScores, #images)
+        for pos = 1, scoreCount do repeat  -- repeat/until true = breakable block
+            local scoreEntry = batchScores[pos]
+            local info = photoByPosition[pos]
+            if not info then
+                log:log("  Warning: no photo at position " .. pos)
+                break
+            end
+
+            local photo = info.photo
+            local filename = info.filename
+            local id = info.id
+
+            -- Compute composite score
+            local composite = BatchStrategy.computeComposite(
+                { technical = scoreEntry.technical, composition = scoreEntry.composition,
+                  emotion = scoreEntry.emotion, moment = scoreEntry.moment },
+                weights, scoreEntry.eye_quality
+            )
+
+            local phash = nil
+
+            -- Write to catalog
             LrTasks.yield()
+            local writeResult = writeScores(
+                catalog, photo, scoreEntry, composite, phash, batchIdx, filename)
+            LrTasks.yield()
+
+            local writeOk = (writeResult == "executed")
+            local writeErr = not writeOk
+                and ("Catalog write not executed (result: " .. tostring(writeResult) .. ")") or nil
 
             if writeOk then
                 successCount = successCount + 1
-                allTechnical[#allTechnical + 1] = scores.technical
-                allAesthetic[#allAesthetic + 1] = scores.aesthetic
-                local hashStr = phash and (" Hash:" .. phash) or ""
-                local eyeStr = (scores.eye_quality and scores.eye_quality ~= "na")
-                    and (" Eye:" .. scores.eye_quality) or ""
-                local detail = string.format("Tech:%d Aest:%d Cat:%s Content:%s%s%s%s",
-                    scores.technical, scores.aesthetic,
-                    scores.dominated_by, scores.content,
-                    eyeStr,
-                    scores.reject and " [REJECT]" or "",
-                    hashStr)
-                log:logImage(filename, "success", detail)
+                allScores.technical[#allScores.technical + 1] = scoreEntry.technical
+                allScores.composition[#allScores.composition + 1] = scoreEntry.composition
+                allScores.emotion[#allScores.emotion + 1] = scoreEntry.emotion
+                allScores.moment[#allScores.moment + 1] = scoreEntry.moment
+                allScores.composite[#allScores.composite + 1] = composite
+
+                -- Build entry for carryover
+                batchScoreEntries[#batchScoreEntries + 1] = {
+                    photo     = photo,
+                    id        = id,
+                    technical   = scoreEntry.technical,
+                    composition = scoreEntry.composition,
+                    emotion     = scoreEntry.emotion,
+                    moment      = scoreEntry.moment,
+                    composite   = composite,
+                    content     = scoreEntry.content,
+                }
+
+                local eyeStr = (scoreEntry.eye_quality and scoreEntry.eye_quality ~= "na")
+                    and (" Eye:" .. scoreEntry.eye_quality) or ""
+                log:log(string.format("  [OK]    %s  ->  T:%d C:%d E:%d M:%d (%.1f) Cat:%s %s%s%s",
+                    filename,
+                    scoreEntry.technical, scoreEntry.composition,
+                    scoreEntry.emotion, scoreEntry.moment, composite,
+                    scoreEntry.category, scoreEntry.content,
+                    eyeStr, scoreEntry.reject and " [REJECT]" or ""))
             else
-                table.insert(errorLog, "- " .. filename .. "\n  Write error: " .. tostring(writeErr))
-                log:logImage(filename, "error", "Write failed: " .. tostring(writeErr))
+                errorLog[#errorLog + 1] = "- " .. filename .. "\n  Write error: " .. tostring(writeErr)
+                log:log("  [FAIL]  " .. filename .. "  ->  Write failed: " .. tostring(writeErr))
             end
-        else
-            table.insert(errorLog, "- " .. filename .. "\n  " .. (err or "unknown error"))
-            log:logImage(filename, "error", err or "unknown error")
-        end
 
-        end -- if not shouldSkip
+        until true end  -- end repeat block, end score loop
 
-        end -- if not calibratedSet[i]
+        -- Update carryover for next batch
+        previousBatchScores = batchScoreEntries
+
+        log:logBatch(batchIdx, totalBatches, #batch,
+            string.format("Done: %d scored, %d errors", #batchScoreEntries, #renderErrors))
 
         LrTasks.sleep(0.05)
-    end
+    until true end  -- end repeat block, end for loop
 
     progress:setPortionComplete(1, 1)
     progress:done()
 
-    -- Log score distribution (before/after if calibration was used)
-    local function logBuckets(label, techArr, aestArr)
-        if #techArr == 0 then return end
-        local buckets = {}
-        for b = 1, 10 do buckets[b] = 0 end
-        for j = 1, #techArr do
-            local c = math.floor(techArr[j] * 0.5 + aestArr[j] * 0.5 + 0.5)
-            if c < 1 then c = 1 end
-            if c > 10 then c = 10 end
-            buckets[c] = buckets[c] + 1
+    -- == Log score distributions ==============================================
+    local function logDimensionStats(name, arr)
+        if #arr == 0 then return end
+        local mn, mx, sum = 10, 1, 0
+        for _, v in ipairs(arr) do
+            if v < mn then mn = v end
+            if v > mx then mx = v end
+            sum = sum + v
         end
-        log:log(label .. " (" .. #techArr .. " photos):")
-        for b = 1, 10 do
-            if buckets[b] > 0 then
-                log:log(string.format("  Score %d: %d", b, buckets[b]))
-            end
-        end
-    end
-    local calScoresLog = calResult.calScores or {}
-    if #calScoresLog > 0 then
-        local ct, ca = {}, {}
-        for _, s in ipairs(calScoresLog) do
-            ct[#ct + 1] = s.technical; ca[#ca + 1] = s.aesthetic
-        end
-        logBuckets("Calibration distribution", ct, ca)
-    end
-    if #allTechnical > 0 then
-        -- Combined (cal + main)
-        local ft, fa = {}, {}
-        for _, s in ipairs(calScoresLog) do
-            ft[#ft + 1] = s.technical; fa[#fa + 1] = s.aesthetic
-        end
-        for j = 1, #allTechnical do
-            ft[#ft + 1] = allTechnical[j]; fa[#fa + 1] = allAesthetic[j]
-        end
-        logBuckets("Final distribution", ft, fa)
+        log:log(string.format("  %s: %d - %d (mean %.1f)", name, mn, mx, sum / #arr))
     end
 
-    -- Finish log
-    log:finish(successCount, #errorLog, skippedScored)
+    if #allScores.technical > 0 then
+        log:log("Score distributions (" .. #allScores.technical .. " photos):")
+        logDimensionStats("Technical", allScores.technical)
+        logDimensionStats("Composition", allScores.composition)
+        logDimensionStats("Emotion", allScores.emotion)
+        logDimensionStats("Moment", allScores.moment)
+        logDimensionStats("Composite", allScores.composite)
+    end
 
-    -- Build completion message
+    if #allSnapshots > 0 then
+        log:log(string.format("Story snapshots collected: %d", #allSnapshots))
+        for _, snap in ipairs(allSnapshots) do
+            log:log(string.format("  Batch %d: %s", snap.batchIndex or 0,
+                tostring(snap.scene or ""):sub(1, 100)))
+        end
+    end
+
+    log:finish(successCount, #errorLog, skippedScored, totalBatches)
+
+    -- == Build completion summary =============================================
     local elapsed = LrDate.currentTime() - startTime
-    local lines = { string.format("%d photo(s) scored via %s (%.0fs elapsed)",
-        successCount, providerLabel, elapsed) }
-    if calibrationStats then
-        lines[#lines + 1] = string.format(
-            "Calibration: %d samples, scores %d-%d (mean %.1f, stddev %.1f)",
-            calibrationStats.sampleCount,
-            calibrationStats.min, calibrationStats.max,
-            calibrationStats.mean, calibrationStats.stddev)
-    end
+    local lines = { string.format("%d photo(s) scored in %d batches via %s (%.0fs elapsed)",
+        successCount, totalBatches, providerLabel, elapsed) }
+
     if skippedScored > 0 then
         lines[#lines + 1] = string.format("%d photo(s) skipped (already scored)", skippedScored)
     end
@@ -713,11 +599,10 @@ local function runScoring(context, calResult)
         lines[#lines + 1] = string.format("%d error(s):\n%s",
             #errorLog, table.concat(errorLog, "\n"):sub(1, 1200))
     end
+
     -- Score distribution breakdown
-    local hasScores = #allTechnical > 0 or #(calResult.calScores or {}) > 0
-    if hasScores then
-        -- Compute per-dimension stats
-        local function stats(arr)
+    if #allScores.technical > 0 then
+        local function dimStats(arr)
             local mn, mx, sum = 10, 1, 0
             for _, v in ipairs(arr) do
                 if v < mn then mn = v end
@@ -727,94 +612,43 @@ local function runScoring(context, calResult)
             return mn, mx, sum / #arr
         end
 
-        -- Build histogram buckets from score arrays
-        local function makeBuckets(techArr, aestArr)
-            local b = {}
-            for k = 1, 10 do b[k] = 0 end
-            for j = 1, #techArr do
-                local c = math.floor(techArr[j] * 0.5 + aestArr[j] * 0.5 + 0.5)
-                if c < 1 then c = 1 end
-                if c > 10 then c = 10 end
-                b[c] = b[c] + 1
+        local tMin, tMax, tMean = dimStats(allScores.technical)
+        local cMin, cMax, cMean = dimStats(allScores.composition)
+        local eMin, eMax, eMean = dimStats(allScores.emotion)
+        local mMin, mMax, mMean = dimStats(allScores.moment)
+
+        lines[#lines + 1] = "\n-- Score Distribution --"
+        lines[#lines + 1] = string.format("Technical:    %d - %d  (mean %.1f)", tMin, tMax, tMean)
+        lines[#lines + 1] = string.format("Composition:  %d - %d  (mean %.1f)", cMin, cMax, cMean)
+        lines[#lines + 1] = string.format("Emotion:      %d - %d  (mean %.1f)", eMin, eMax, eMean)
+        lines[#lines + 1] = string.format("Moment:       %d - %d  (mean %.1f)", mMin, mMax, mMean)
+
+        -- Composite histogram
+        local buckets = {}
+        for b = 1, 10 do buckets[b] = 0 end
+        for _, v in ipairs(allScores.composite) do
+            local b = math.floor(v + 0.5)
+            if b < 1 then b = 1 end
+            if b > 10 then b = 10 end
+            buckets[b] = buckets[b] + 1
+        end
+
+        local maxB = 0
+        for b = 1, 10 do
+            if buckets[b] > maxB then maxB = buckets[b] end
+        end
+
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Composite Score Distribution:"
+        local barW = 16
+        for b = 1, 10 do
+            local bar = ""
+            if maxB > 0 then
+                local len = math.floor(buckets[b] / maxB * barW + 0.5)
+                bar = string.rep("#", len)
             end
-            return b
-        end
-
-        -- Calibration (before) buckets
-        local calScores = calResult.calScores or {}
-        local calTech, calAest = {}, {}
-        for _, s in ipairs(calScores) do
-            calTech[#calTech + 1] = s.technical
-            calAest[#calAest + 1] = s.aesthetic
-        end
-        local calBuckets = makeBuckets(calTech, calAest)
-
-        -- Final (after) buckets — all scores combined
-        local finalTech, finalAest = {}, {}
-        for _, s in ipairs(calScores) do
-            finalTech[#finalTech + 1] = s.technical
-            finalAest[#finalAest + 1] = s.aesthetic
-        end
-        for j = 1, #allTechnical do
-            finalTech[#finalTech + 1] = allTechnical[j]
-            finalAest[#finalAest + 1] = allAesthetic[j]
-        end
-        local finalBuckets = makeBuckets(finalTech, finalAest)
-
-        local tMin, tMax, tMean = stats(finalTech)
-        local aMin, aMax, aMean = stats(finalAest)
-
-        lines[#lines + 1] = "\n— Score Distribution —"
-        lines[#lines + 1] = string.format("Technical:  %d – %d  (mean %.1f)", tMin, tMax, tMean)
-        lines[#lines + 1] = string.format("Aesthetic:  %d – %d  (mean %.1f)", aMin, aMax, aMean)
-
-        if #calTech > 0 then
-            -- Side-by-side: Calibration vs Final (percentage-based for fair comparison)
-            local barW = 10
-            local calN = math.max(#calTech, 1)
-            local finalN = math.max(#finalTech, 1)
-
-            -- Find global max percentage across both columns
-            local maxPct = 0
-            for b = 1, 10 do
-                local cp = calBuckets[b] / calN
-                local fp = finalBuckets[b] / finalN
-                if cp > maxPct then maxPct = cp end
-                if fp > maxPct then maxPct = fp end
-            end
-            if maxPct == 0 then maxPct = 1 end
-
-            lines[#lines + 1] = ""
             lines[#lines + 1] = string.format(
-                "      Calibration (%d)              All Scores (%d)", calN, finalN)
-            for b = 1, 10 do
-                local calLen = math.floor(calBuckets[b] / calN / maxPct * barW + 0.5)
-                local finalLen = math.floor(finalBuckets[b] / finalN / maxPct * barW + 0.5)
-
-                local calBar = string.rep("#", calLen)
-                local finalBar = string.rep("#", finalLen)
-
-                lines[#lines + 1] = string.format(
-                    " %2d │ %-" .. barW .. "s %3d   │ %-" .. barW .. "s %3d",
-                    b, calBar, calBuckets[b], finalBar, finalBuckets[b])
-            end
-        else
-            -- No calibration — single histogram
-            local barW = 16
-            local maxB = 0
-            for b = 1, 10 do
-                if finalBuckets[b] > maxB then maxB = finalBuckets[b] end
-            end
-            lines[#lines + 1] = ""
-            for b = 1, 10 do
-                local bar = ""
-                if maxB > 0 then
-                    local len = math.floor(finalBuckets[b] / maxB * barW + 0.5)
-                    bar = string.rep("#", len)
-                end
-                lines[#lines + 1] = string.format(
-                    " %2d │ %-" .. barW .. "s %d", b, bar, finalBuckets[b])
-            end
+                " %2d | %-" .. barW .. "s %d", b, bar, buckets[b])
         end
     end
 
@@ -825,29 +659,20 @@ local function runScoring(context, calResult)
         lines[#lines + 1] = "\nLogging failed: " .. log.initError
     end
 
-    return successCount, #errorLog, skippedScored, table.concat(lines, "\n")
+    return successCount, #errorLog, skippedScored, table.concat(lines, "\n"), allSnapshots
 end
 
--- ── Module export vs standalone entry point ────────────────────────────
--- When loaded via dofile from ScoreAndSelect.lua, the caller sets this
--- global flag so we skip the standalone async task (otherwise two scoring
--- runs would start simultaneously).
+-- == Module export vs standalone entry point ==================================
 if _G._AI_SELECTS_MODULE_LOAD then
-    return { runScoring = runScoring, runCalibration = runCalibration }
+    return { runScoring = runScoring }
 end
 
--- Standalone entry point (menu item): wrap in async task + error handler.
+-- Standalone entry point (menu item): wrap in async task.
 LrTasks.startAsyncTask(function()
     LrFunctionContext.callWithContext("AISelectsScorePhotos", function(context)
-        local ok, err = LrTasks.pcall(function()
-            local success, errors, skips, summary = runScoring(context)
-            if summary then
-                LrDialogs.message("AI Selects - Scoring Complete", summary, "info")
-            end
-        end)
-        if not ok then
-            LrDialogs.message("AI Selects - Error",
-                "An unexpected error occurred during scoring:\n\n" .. tostring(err), "critical")
+        local success, errors, skips, summary = runScoring(context)
+        if summary then
+            LrDialogs.message("AI Selects - Scoring Complete", summary, "info")
         end
     end)
 end)
