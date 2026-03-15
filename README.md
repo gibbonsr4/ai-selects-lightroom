@@ -27,9 +27,9 @@ AI-powered photo culling for Lightroom Classic. Score hundreds of photos using v
 - Lightroom Classic (SDK 6.0+)
 - One of:
   - **Ollama** installed locally with a vision model (free, private, no API key needed)
-  - **Anthropic API key** for Claude (recommended — fast, high quality)
+  - **Anthropic API key** for Claude (recommended — highest quality)
+  - **Google API key** for Gemini (recommended — fastest and cheapest, ~$0.03 for 68 photos)
   - **OpenAI API key** for GPT-4o/GPT-4V
-  - **Google API key** for Gemini
 
 ## Installation
 
@@ -84,15 +84,21 @@ Pipeline: Reject → Burst Dedup → Visual Dedup (dHash) → Content Dedup → 
 AI-driven narrative selection using a multi-pass architecture:
 
 ```
-Pass 1: Score (AI vision — per photo)
-Pass 2: Story Assembly (AI text — metadata summary → beat list)
-Pass 3: Candidate Shortlisting
+Pass 1:   Score (AI vision — per photo)
+Pre-Pass: Scene/Moment Inventory (AI text — clusters photos by WHO+WHEN+WHAT)
+Pass 2:   Story Assembly (AI text — plans beats from moment inventory)
+Pass 3:   Candidate Shortlisting
   3A: Code pre-filter (hard constraints per beat)
   3B: AI text ranking (order candidates by fit)
-Pass 4: Beat Casting (AI vision — compare candidates per beat)
-Pass 5: Story Review (AI vision — review full selection for coherence)
-Pass 6: Swap Resolution (AI vision — targeted replacements)
+Pass 4:   Beat Casting (AI vision — compare candidates per beat, scarcity-first order)
+Pass 4.5: Similarity Gate (phash — catches near-duplicate selections)
+Pass 5:   Story Review (AI vision — review full selection for coherence)
+Pass 6:   Swap Resolution (AI vision — targeted replacements)
 ```
+
+The **Scene Inventory** clusters all photos into distinct moments using WHO (people groups), WHEN (capture time as primary signal), and WHAT (activity). This gives the story assembly a bird's-eye view of all available content, preventing duplicate beats and ensuring coverage of unique moments. The clustering is duration-adaptive — handling everything from 1-hour portrait sessions to multi-year compilations.
+
+**Scarcity-first beat ordering** in Pass 4 processes beats with the fewest candidates first, preventing the common problem where later beats find all their candidates already consumed by earlier beats.
 
 Before scoring, a mid-run dialog lets you describe the story in natural language and optionally emphasize specific moments. The AI pre-populates a summary based on what it saw during scoring.
 
@@ -202,7 +208,7 @@ Run-specific settings (mode, target count, weights, story preset) are configured
 
 **Scoring is slow** — Try reducing Render Size in Settings. For local models, smaller models score faster. Claude Haiku is the fastest cloud option.
 
-**Story mode falls back to Best Of** — The AI response couldn't be parsed. Check logs for details. This can happen with smaller local models that struggle with structured JSON responses. Claude models handle it reliably.
+**Story mode falls back to Best Of** — The AI response couldn't be parsed. Check logs for details. This can happen with smaller local models that struggle with structured JSON responses. Claude and Gemini handle it reliably. If a response was truncated, the log will say "TRUNCATED — model hit output token limit."
 
 **Face coverage not working** — Make sure you've used Lightroom's People view and named faces. Only named people get coverage guarantees.
 

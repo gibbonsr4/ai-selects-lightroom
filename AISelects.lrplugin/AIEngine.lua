@@ -431,6 +431,82 @@ Total photos: %%TOTAL_PHOTOS%%
 
 Write ONLY the summary, nothing else. No JSON, no bullet points — just natural language.]]
 
+-- == v3 Scene Inventory prompt (pre-Pass 2) ====================================
+-- Text-only call: clusters all photos into distinct visual scenes to give the
+-- story assembly pass a birds-eye view of what's available. Prevents the AI
+-- from creating redundant beats for similar content and ensures coverage of
+-- distinct moments.
+M.SCENE_INVENTORY_PROMPT_TEMPLATE = [[You are analyzing a photo collection to identify distinct MOMENTS.
+
+## Collection Context
+%%COLLECTION_CONTEXT%%
+
+## Photo Collection (sorted chronologically)
+%%PHOTO_LIST%%
+
+## Task
+Group these photos into DISTINCT MOMENTS — specific points in time when a particular group of people was doing a particular thing. Your goal is to help a story editor understand what unique moments exist so they can select one photo from each moment without redundancy.
+
+## How to Identify Moments
+
+### Step 1: Use CAPTURE TIME as the primary signal
+Timestamps are the most reliable way to separate moments. Follow these rules strictly:
+- Photos taken within ~2 minutes of each other with the same people = SAME moment (burst/posing variations)
+- A gap of 10+ minutes almost always means a DIFFERENT moment, even if the subject looks similar
+- A gap of 1+ hours is DEFINITELY a different moment
+- For multi-day collections, any photos on different days are different moments regardless of similarity
+
+### Step 2: Use PEOPLE as the secondary signal
+Within the same time block, different combinations of people = different moments:
+- Identify recurring people groups (e.g., "the couple", "the kids", "the whole family", "grandparents with grandkids")
+- "Tom & Sarah alone" is a different moment than "Tom, Sarah & kids" even if taken 5 minutes apart at the same location
+- Solo portraits are distinct from group shots at the same time/place
+
+### Step 3: Use ACTIVITY as the tiebreaker
+If time and people are the same, different activities distinguish moments:
+- "Kids swimming" vs "Kids eating lunch" — same kids, but different activity
+- "Family posing for photo" vs "Family playing game" — same group, but different activity
+
+### What is the SAME moment (merge these):
+- Burst shots of the same group in the same pose within seconds
+- Multiple attempts at the same group photo taken back-to-back
+- Slight reframings of the same scene taken seconds apart
+- Photographer walking around the same scene (same people, same activity, within 1-2 minutes)
+
+## People Groups
+%%PEOPLE_GROUPS%%
+
+## Output Format
+For each moment, provide:
+- scene_id: sequential number
+- name: descriptive name including WHO and WHAT (e.g., "Tom & Sarah — couple portrait by lake", "Full group — arrival photo on dock")
+- photo_numbers: array of photo numbers belonging to this moment
+- count: how many photos in this moment
+- best_composite: highest composite score among the photos
+- time_range: approximate time range (e.g., "10:30-10:45" or "Day 3 afternoon")
+- people: array of people names visible (if any)
+- people_group: which recurring group this features (e.g., "the couple", "whole family", "kids only")
+- categories: array of photo categories in this moment
+- redundancy_note: if this moment could potentially be consolidated with another moment in a tight edit, note which and why (otherwise null). Use this ONLY for moments that serve a very similar narrative purpose — not just similar locations.
+
+## Rules
+- A moment should represent a SPECIFIC OCCURRENCE, not a category of activity.
+- "Kids swimming" is too broad if it happened on 3 different days — those are 3 moments.
+- Moments with only 1 photo are fine and common — a candid caught once is still a distinct moment.
+- Order moments chronologically.
+- The redundancy_note is for the story editor's benefit: "If space is tight, this moment serves a similar narrative role as Moment X." It does NOT mean they should be merged — both are real distinct moments.
+
+Return ONLY valid JSON:
+```json
+{
+  "scenes": [...],
+  "total_scenes": 0,
+  "people_groups_identified": ["the couple (Tom & Sarah)", "the kids (Emma, Jake)", "whole family"],
+  "coverage_summary": "Brief note on what distinct moments this collection covers and the overall narrative arc",
+  "redundancy_warnings": ["If space is tight: Moments X and Y serve similar narrative roles — the editor may want to pick one"]
+}
+```]]
+
 -- == v3 Story Assembly prompt (Pass 2) ========================================
 -- Text-only call: takes user story prompt + metadata rollup + snapshots → beat list.
 -- This is the "spread all photos on the table" moment.
@@ -447,11 +523,29 @@ M.STORY_ASSEMBLY_PROMPT_TEMPLATE = [[You are an expert photo editor planning a c
 ## Collection Overview
 %%METADATA_ROLLUP%%
 
+## Moment Inventory (photos grouped into distinct moments)
+%%SCENE_INVENTORY%%
+
 ## All Photos (text descriptions only — no images)
 %%ALL_PHOTOS%%
 
 ## Task
 Plan a photo story of exactly %%TARGET_COUNT%% beats (one photo per beat). Each beat represents a moment in the story. You are designing the story structure — later, a vision model will look at candidate photos to pick the best match for each beat.
+
+CRITICAL: Use the Moment Inventory above to maximize coverage of distinct moments. Each beat should ideally draw from a DIFFERENT moment. Key rules:
+- Prioritize BREADTH over DEPTH — one photo from each of 30 moments is better than 3 photos from 10 moments.
+- Every moment in the inventory is a real, distinct occurrence (different people, time, or activity). Treat them as such even if the descriptions sound similar.
+- If the target count is less than the number of moments, you must prioritize — favor moments that are narratively important, emotionally strong, or feature underrepresented people.
+- If the target count exceeds the number of moments, you may draw multiple beats from the same moment, but prefer moments with high photo counts and score variety.
+- Pay attention to redundancy_notes — when space is tight, they suggest which moments serve similar narrative roles so you can choose between them.
+
+VISUAL DIVERSITY — the most common failure mode is creating beats that look the same:
+- NEVER create two beats with the same visual content type. Two "person holding fish trophy" beats, two "rods bent at the stern" beats, or two "sunset landscape" beats will produce a repetitive story. Merge them into one beat or cut one.
+- Each beat's description should produce a VISUALLY DISTINCT photo. Ask yourself: "Would a viewer flipping through these see variety, or repetition?"
+- Unique moments (1-2 photos in the inventory) are precious — they are the only chance to show that content. Prioritize them over yet another variation of a common moment.
+- Quiet, candid, or transitional moments (someone resting, cooking, laughing between action) are what give a story texture. Don't fill every slot with peak action.
+- The story needs a genuine closing — end with an environmental or reflective beat, not an action peak.
+- Unique subject matter (underwater, wildlife, aerial, macro) should be included even if image quality is lower — these are irreplaceable perspectives that add dimension to the story.
 
 For each beat, specify:
 - position: sequence number (1 to %%TARGET_COUNT%%)
@@ -479,6 +573,9 @@ Also include:
 - Reference the photographer's story and emphasis when prioritizing moments
 - Use the event timeline to ground beats in what actually happened
 - Set min_composite appropriately — hero shots should require higher scores, transitional shots can be lower
+- NO TWO BEATS should produce visually similar photos — every beat must describe a different visual scene (different people, different activity, different setting)
+- Include at least one quiet/candid/transitional moment (rest, food, travel, laughter between action) — these give the story texture and breathing room
+- Unique 1-photo moments from the inventory deserve strong consideration — they cannot be represented any other way
 
 Return ONLY valid JSON. No explanation, no markdown, no commentary.
 
@@ -671,6 +768,79 @@ end
 
 function M.trim(s)
     return s:match("^%s*(.-)%s*$") or ''
+end
+
+-- Robust JSON extraction from AI responses that may be wrapped in markdown fences.
+-- Uses string.find instead of pattern matching to handle large responses and
+-- responses containing backticks in string values.
+-- Returns (table, nil) on success or (nil, errorMsg) on failure.
+function M.extractJSON(raw)
+    if not raw or raw == "" then
+        return nil, "Empty response"
+    end
+
+    -- Level 1: Direct JSON parse
+    local ok, data = pcall(json.decode, raw)
+    if ok and type(data) == "table" then
+        return data, nil
+    end
+
+    -- Level 2: Strip markdown fences using string.find (not pattern match)
+    -- Find opening fence: ```json or ```
+    local fenceStart = raw:find("```json")
+    local contentStart
+    if fenceStart then
+        contentStart = fenceStart + 7  -- skip ```json
+    else
+        fenceStart = raw:find("```")
+        if fenceStart then
+            contentStart = fenceStart + 3
+        end
+    end
+    if contentStart then
+        -- Find the LAST ``` in the string (closing fence)
+        local lastFence = nil
+        local searchFrom = contentStart
+        while true do
+            local pos = raw:find("```", searchFrom, true)  -- plain find
+            if not pos then break end
+            lastFence = pos
+            searchFrom = pos + 3
+        end
+        if lastFence and lastFence > contentStart then
+            local block = raw:sub(contentStart, lastFence - 1)
+            ok, data = pcall(json.decode, M.trim(block))
+            if ok and type(data) == "table" then
+                return data, nil
+            end
+        end
+    end
+
+    -- Level 3: Find JSON object in surrounding text (first { to last })
+    local objStart = raw:find("{")
+    local objEnd = raw:reverse():find("}")
+    if objStart and objEnd then
+        objEnd = #raw - objEnd + 1
+        local objStr = raw:sub(objStart, objEnd)
+        ok, data = pcall(json.decode, objStr)
+        if ok and type(data) == "table" then
+            return data, nil
+        end
+    end
+
+    -- Level 4: Find JSON array (first [ to last ])
+    local arrStart = raw:find("%[")
+    local arrEnd = raw:reverse():find("%]")
+    if arrStart and arrEnd then
+        arrEnd = #raw - arrEnd + 1
+        local arrStr = raw:sub(arrStart, arrEnd)
+        ok, data = pcall(json.decode, arrStr)
+        if ok and type(data) == "table" then
+            return data, nil
+        end
+    end
+
+    return nil, "Could not parse JSON from response: " .. raw:sub(1, 200)
 end
 
 function M.safeDelete(path)
@@ -927,38 +1097,37 @@ end
 -- Expects JSON: { "scores": [...], "snapshot": {...} }
 -- Returns (scoresArray, snapshot, nil) or (nil, nil, errorMsg).
 -- Scores are returned IN ORDER — caller maps by position, not by ID.
-function M.parseBatchResponse(raw)
+function M.parseBatchResponse(raw, stopReason)
     if not raw or raw == "" then
         return nil, nil, "Empty response from model"
     end
 
-    local ok, data
-
-    -- Level 1: Direct JSON parse
-    ok, data = pcall(json.decode, raw)
-
-    -- Level 2: Extract JSON from markdown code block
-    if not (ok and type(data) == "table") then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
+    -- Check for truncation from the provider's stop reason
+    local truncated = false
+    if stopReason then
+        local sr = stopReason:lower()
+        if sr == "max_tokens" or sr == "length" or sr == "maxoutputtokens"
+           or sr == "max_output_tokens" then
+            truncated = true
         end
     end
 
-    -- Level 3: Find JSON object in surrounding text
-    if not (ok and type(data) == "table") then
-        local objStart = raw:find("{")
-        local objEnd = raw:reverse():find("}")
-        if objStart and objEnd then
-            objEnd = #raw - objEnd + 1
-            local objStr = raw:sub(objStart, objEnd)
-            ok, data = pcall(json.decode, objStr)
+    local data, extractErr = M.extractJSON(raw)
+    if not data then
+        -- If JSON parse failed, attempt partial recovery of individual score objects
+        local partialScores = M.recoverPartialScores(raw)
+        if partialScores and #partialScores > 0 then
+            local warnMsg = string.format(
+                "Response %s— recovered %d of partial scores from malformed JSON",
+                truncated and "TRUNCATED (model hit output token limit) " or "",
+                #partialScores)
+            return partialScores, nil, warnMsg
         end
-    end
 
-    if not ok or type(data) ~= "table" then
-        return nil, nil, "Could not parse batch response as JSON: " .. raw:sub(1, 300)
+        local reason = truncated
+            and "Response TRUNCATED — model hit output token limit. Try reducing batch size or switching providers."
+            or ("Could not parse batch response as JSON: " .. (extractErr or raw:sub(1, 300)))
+        return nil, nil, reason
     end
 
     -- Extract scores array — could be data.scores or data itself if it's an array
@@ -984,7 +1153,34 @@ function M.parseBatchResponse(raw)
     -- Extract snapshot (may be nil for Ollama)
     local snapshot = data.snapshot
 
-    return scores, snapshot, nil
+    -- Warn if truncated even though we got some scores (snapshot may be missing)
+    local warnMsg = nil
+    if truncated then
+        warnMsg = string.format(
+            "Response truncated (model hit output token limit) — got %d scores but snapshot may be incomplete",
+            #scores)
+    end
+
+    return scores, snapshot, warnMsg
+end
+
+-- == Partial score recovery ===================================================
+-- When JSON is truncated mid-response, try to extract individual score objects.
+-- Each score is a self-contained {...} block with "technical", "composition", etc.
+function M.recoverPartialScores(raw)
+    local scores = {}
+    -- Find all complete JSON objects that look like score entries
+    -- Pattern: { ... "technical" ... "content" ... }
+    for obj in raw:gmatch('%b{}') do
+        -- Check if this looks like a score object (has technical and content fields)
+        if obj:find('"technical"') and obj:find('"content"') then
+            local ok, data = pcall(json.decode, obj)
+            if ok and type(data) == "table" and data.technical then
+                scores[#scores + 1] = M.normalizeScores(data)
+            end
+        end
+    end
+    return scores
 end
 
 -- == curl helper ==============================================================
@@ -1205,10 +1401,13 @@ function M.queryClaudeBatch(images, imageLabels, anchorImages, anchorLabels,
             decoded.usage.input_tokens, decoded.usage.output_tokens)
     end
 
+    -- stop_reason: "end_turn", "max_tokens", "stop_sequence"
+    local stopReason = decoded.stop_reason
+
     if decoded.content and type(decoded.content) == "table" then
         for _, block in ipairs(decoded.content) do
             if block.type == "text" and block.text then
-                return block.text, nil
+                return block.text, nil, stopReason
             end
         end
     end
@@ -1318,8 +1517,12 @@ function M.queryOpenAIBatch(images, imageLabels, anchorImages, anchorLabels,
             decoded.usage.prompt_tokens, decoded.usage.completion_tokens)
     end
 
+    -- finish_reason: "stop", "length" (= max tokens hit)
+    local stopReason = decoded.choices and decoded.choices[1]
+        and decoded.choices[1].finish_reason
+
     if decoded.choices and decoded.choices[1] and decoded.choices[1].message then
-        return decoded.choices[1].message.content, nil
+        return decoded.choices[1].message.content, nil, stopReason
     end
 
     return nil, "Unexpected OpenAI response: " .. tostring(result):sub(1, 200)
@@ -1375,13 +1578,21 @@ function M.queryGeminiBatch(images, imageLabels, anchorImages, anchorLabels,
         text = prompt,
     }
 
+    -- Gemini 2.5 models use "thinking" by default, which consumes output tokens.
+    -- Disable thinking for structured scoring to prevent response truncation.
+    local isThinkingModel = geminiModel:find("2%.5") ~= nil
+    local genConfig = {
+        maxOutputTokens = maxTokens or 4096,
+    }
+    if isThinkingModel then
+        genConfig.thinkingConfig = { thinkingBudget = 0 }
+    end
+
     local encodeOk, body = pcall(json.encode, {
         contents = {{
             parts = parts,
         }},
-        generationConfig = {
-            maxOutputTokens = maxTokens or 4096,
-        },
+        generationConfig = genConfig,
     })
     if not encodeOk then return nil, "JSON encode failed: " .. tostring(body) end
 
@@ -1425,13 +1636,33 @@ function M.queryGeminiBatch(images, imageLabels, anchorImages, anchorLabels,
             decoded.usageMetadata.candidatesTokenCount)
     end
 
+    -- finishReason: "STOP", "MAX_TOKENS", "SAFETY"
+    local stopReason = decoded.candidates and decoded.candidates[1]
+        and decoded.candidates[1].finishReason
+
     if decoded.candidates and decoded.candidates[1]
        and decoded.candidates[1].content
        and decoded.candidates[1].content.parts then
-        for _, part in ipairs(decoded.candidates[1].content.parts) do
-            if part.text then
-                return part.text, nil
+        local parts = decoded.candidates[1].content.parts
+        -- Gemini 2.5 models may include "thought" parts (thinking/reasoning).
+        -- We need the LAST non-thought text part (the actual response).
+        local lastText = nil
+        for _, part in ipairs(parts) do
+            if part.text and not part.thought then
+                lastText = part.text
             end
+        end
+        if lastText then
+            return lastText, nil, stopReason
+        end
+        -- Fallback: if all parts are thought parts, take the last text part anyway
+        for _, part in ipairs(parts) do
+            if part.text then
+                lastText = part.text
+            end
+        end
+        if lastText then
+            return lastText, nil, stopReason
         end
     end
 
@@ -1562,10 +1793,13 @@ function M.queryClaudeText(prompt, claudeModel, apiKey, timeoutSecs, maxTokens)
             decoded.usage.input_tokens, decoded.usage.output_tokens)
     end
 
+    -- stop_reason: "end_turn", "max_tokens", "stop_sequence"
+    local stopReason = decoded.stop_reason
+
     if decoded.content and type(decoded.content) == "table" then
         for _, block in ipairs(decoded.content) do
             if block.type == "text" and block.text then
-                return block.text, nil
+                return block.text, nil, stopReason
             end
         end
     end
@@ -1620,8 +1854,12 @@ function M.queryOpenAIText(prompt, openaiModel, apiKey, timeoutSecs, maxTokens)
             decoded.usage.prompt_tokens, decoded.usage.completion_tokens)
     end
 
+    -- finish_reason: "stop", "length" (= max tokens hit)
+    local stopReason = decoded.choices and decoded.choices[1]
+        and decoded.choices[1].finish_reason
+
     if decoded.choices and decoded.choices[1] and decoded.choices[1].message then
-        return decoded.choices[1].message.content, nil
+        return decoded.choices[1].message.content, nil, stopReason
     end
 
     return nil, "Unexpected OpenAI response: " .. tostring(result):sub(1, 200)
@@ -1629,15 +1867,24 @@ end
 
 function M.queryGeminiText(prompt, geminiModel, apiKey, timeoutSecs, maxTokens)
     local ts = tostring(math.floor(LrDate.currentTime() * 1000))
+
+    -- Gemini 2.5 models use "thinking" by default, which consumes output tokens.
+    -- Disable thinking for structured JSON responses to prevent truncation.
+    local isThinkingModel = geminiModel:find("2%.5") ~= nil
+    local genConfig = {
+        maxOutputTokens = maxTokens or 8192,
+    }
+    if isThinkingModel then
+        genConfig.thinkingConfig = { thinkingBudget = 0 }
+    end
+
     local encodeOk, body = pcall(json.encode, {
         contents = {{
             parts = {
                 { text = prompt },
             },
         }},
-        generationConfig = {
-            maxOutputTokens = maxTokens or 8192,
-        },
+        generationConfig = genConfig,
     })
     if not encodeOk then return nil, "JSON encode failed: " .. tostring(body) end
 
@@ -1680,13 +1927,32 @@ function M.queryGeminiText(prompt, geminiModel, apiKey, timeoutSecs, maxTokens)
             decoded.usageMetadata.candidatesTokenCount)
     end
 
+    -- finishReason: "STOP", "MAX_TOKENS", "SAFETY"
+    local stopReason = decoded.candidates and decoded.candidates[1]
+        and decoded.candidates[1].finishReason
+
     if decoded.candidates and decoded.candidates[1]
        and decoded.candidates[1].content
        and decoded.candidates[1].content.parts then
+        -- Gemini 2.5 models may include "thought" parts (thinking/reasoning).
+        -- We need the LAST non-thought text part (the actual response).
+        local lastText = nil
+        for _, part in ipairs(decoded.candidates[1].content.parts) do
+            if part.text and not part.thought then
+                lastText = part.text
+            end
+        end
+        if lastText then
+            return lastText, nil, stopReason
+        end
+        -- Fallback: if all parts are thought parts, take the last text part anyway
         for _, part in ipairs(decoded.candidates[1].content.parts) do
             if part.text then
-                return part.text, nil
+                lastText = part.text
             end
+        end
+        if lastText then
+            return lastText, nil, stopReason
         end
     end
 
@@ -1725,13 +1991,14 @@ function M.parseStoryResponse(raw, validIds)
         return nil, "Empty response from model"
     end
 
-    -- Try to extract JSON array from the response
-    local ok, data = pcall(json.decode, raw)
-    if ok and type(data) == "table" then
-        -- Could be the array directly, or wrapped in an object
-        if #data > 0 and data[1].id then
-            -- it's already a valid array
-        elseif data.selections and type(data.selections) == "table" then
+    local data, extractErr = M.extractJSON(raw)
+    if not data then
+        return nil, "Could not parse story response as JSON: " .. (extractErr or raw:sub(1, 300))
+    end
+
+    -- Could be the array directly, or wrapped in an object
+    if not (#data > 0 and data[1] and data[1].id) then
+        if data.selections and type(data.selections) == "table" then
             data = data.selections
         elseif data.photos and type(data.photos) == "table" then
             data = data.photos
@@ -1740,28 +2007,8 @@ function M.parseStoryResponse(raw, validIds)
         end
     end
 
-    -- Level 2: Extract from markdown code block
-    if not (ok and type(data) == "table" and #data > 0) then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-
-    -- Level 3: Find JSON array in surrounding text
-    if not (ok and type(data) == "table" and #data > 0) then
-        local arrStart = raw:find("%[")
-        local arrEnd = raw:reverse():find("%]")
-        if arrStart and arrEnd then
-            arrEnd = #raw - arrEnd + 1
-            local arrStr = raw:sub(arrStart, arrEnd)
-            ok, data = pcall(json.decode, arrStr)
-        end
-    end
-
-    if not ok or type(data) ~= "table" or #data == 0 then
-        return nil, "Could not parse story response as JSON array: " .. raw:sub(1, 300)
+    if type(data) ~= "table" or #data == 0 then
+        return nil, "No selections array in story response: " .. raw:sub(1, 300)
     end
 
     -- Build valid ID lookup set
@@ -2066,7 +2313,171 @@ function M.buildMetadataRollup(photoStore)
         people = people,
         groupShots = groupShots,
         timeRange = timeRange,
+        _minTime = minTime,   -- raw timestamps for duration calculation
+        _maxTime = maxTime,
     }
+end
+
+-- == v3 Scene Inventory prompt builder =========================================
+-- Builds the scene inventory prompt from the photo list text + collection context.
+-- @param allPhotosText  String: formatted text of all photo metadata (same as Pass 2)
+-- @param rollup         Table: from buildMetadataRollup (has timeRange, people, etc.)
+-- @return string: the complete prompt
+function M.buildSceneInventoryPrompt(allPhotosText, rollup)
+    local prompt = M.SCENE_INVENTORY_PROMPT_TEMPLATE
+
+    -- Build collection context: trip duration, total photos, time span
+    local contextParts = {}
+    contextParts[#contextParts + 1] = string.format("Total photos: %d", rollup.totalPhotos or 0)
+    if rollup.timeRange and rollup.timeRange ~= "" then
+        contextParts[#contextParts + 1] = "Time span: " .. rollup.timeRange
+    end
+    -- Calculate duration in human terms
+    if rollup._minTime and rollup._maxTime then
+        local durationSecs = rollup._maxTime - rollup._minTime
+        local durationMins = math.floor(durationSecs / 60)
+        local durationHours = math.floor(durationMins / 60)
+        local durationDays = math.floor(durationHours / 24)
+        local durationMonths = math.floor(durationDays / 30)
+        local durationYears = math.floor(durationDays / 365)
+        if durationYears >= 1 then
+            contextParts[#contextParts + 1] = string.format(
+                "Duration: ~%d year(s) — this is a COMPILATION spanning a long period. "
+                .. "Photos are NOT from a single trip or event. Each shooting session or date "
+                .. "is its own independent context. Time gaps between sessions can be weeks or months.",
+                durationYears)
+        elseif durationMonths >= 1 then
+            contextParts[#contextParts + 1] = string.format(
+                "Duration: ~%d month(s) — this collection spans multiple weeks. "
+                .. "Look for clusters of photos on specific dates as distinct shooting sessions. "
+                .. "Photos on different dates are always different moments.",
+                durationMonths)
+        elseif durationDays > 1 then
+            contextParts[#contextParts + 1] = string.format(
+                "Duration: %d days — this is a MULTI-DAY collection (e.g., a trip or event). "
+                .. "Photos on different days are always different moments, even if the subject is similar.",
+                durationDays)
+        elseif durationHours > 2 then
+            contextParts[#contextParts + 1] = string.format(
+                "Duration: ~%d hours — this is a long session spanning most of a day.",
+                durationHours)
+        elseif durationMins > 30 then
+            contextParts[#contextParts + 1] = string.format(
+                "Duration: ~%d minutes — this is a single session.",
+                durationMins)
+        else
+            contextParts[#contextParts + 1] = string.format(
+                "Duration: ~%d minutes — this is a short, focused session.",
+                durationMins)
+        end
+    end
+    local collectionContext = table.concat(contextParts, "\n")
+
+    -- Build people groups section from rollup
+    local peopleLines = {}
+    if rollup.people and next(rollup.people) then
+        peopleLines[#peopleLines + 1] = "Named people in this collection:"
+        -- Sort by frequency
+        local sortedPeople = {}
+        for name, info in pairs(rollup.people) do
+            sortedPeople[#sortedPeople + 1] = { name = name, count = info.count, solo = info.soloCount }
+        end
+        table.sort(sortedPeople, function(a, b) return a.count > b.count end)
+        for _, p in ipairs(sortedPeople) do
+            peopleLines[#peopleLines + 1] = string.format(
+                "- %s: appears in %d photos (%d solo shots)",
+                p.name, p.count, p.solo)
+        end
+        if rollup.groupShots and rollup.groupShots > 0 then
+            peopleLines[#peopleLines + 1] = string.format(
+                "\nGroup shots (3+ people): %d photos", rollup.groupShots)
+        end
+        peopleLines[#peopleLines + 1] = "\nLook for recurring combinations of these people to identify people groups (e.g., \"the couple\", \"the kids\", \"whole family\")."
+    else
+        peopleLines[#peopleLines + 1] = "No named people detected in this collection."
+    end
+    local peopleGroupsText = table.concat(peopleLines, "\n")
+
+    prompt = prompt:gsub("%%%%COLLECTION_CONTEXT%%%%", function() return collectionContext end)
+    prompt = prompt:gsub("%%%%PHOTO_LIST%%%%", function() return allPhotosText end)
+    prompt = prompt:gsub("%%%%PEOPLE_GROUPS%%%%", function() return peopleGroupsText end)
+    return prompt
+end
+
+-- == v3 Scene Inventory response parser =======================================
+-- @param raw  String: raw AI response
+-- @return (inventoryTable, nil) or (nil, errorMsg)
+function M.parseSceneInventoryResponse(raw)
+    local data, extractErr = M.extractJSON(raw)
+    if not data then
+        return nil, "Could not parse scene inventory JSON: " .. (extractErr or "")
+    end
+
+    -- Validate scenes array exists
+    local scenes = data.scenes
+    if not scenes or type(scenes) ~= "table" or #scenes == 0 then
+        return nil, "Scene inventory has no scenes"
+    end
+
+    return data, nil
+end
+
+-- == v3 Format scene inventory for injection into Pass 2 prompt ===============
+-- Converts the parsed scene inventory into readable text for the story assembly.
+-- @param inventory  Table: parsed scene inventory (from parseSceneInventoryResponse)
+-- @return string: formatted text
+function M.formatSceneInventory(inventory)
+    local lines = {}
+
+    lines[#lines + 1] = string.format("Total distinct moments: %d",
+        inventory.total_scenes or #inventory.scenes)
+
+    if inventory.people_groups_identified and #inventory.people_groups_identified > 0 then
+        lines[#lines + 1] = "People groups: " .. table.concat(inventory.people_groups_identified, ", ")
+    end
+    if inventory.coverage_summary then
+        lines[#lines + 1] = "Coverage: " .. inventory.coverage_summary
+    end
+
+    lines[#lines + 1] = ""
+
+    for _, scene in ipairs(inventory.scenes) do
+        local header = string.format("Moment %d: %s (%d photos, best=%.1f, time=%s)",
+            scene.scene_id or 0,
+            scene.name or "unnamed",
+            scene.count or #(scene.photo_numbers or {}),
+            scene.best_composite or 0,
+            scene.time_range or "unknown")
+        lines[#lines + 1] = header
+
+        if scene.people_group then
+            lines[#lines + 1] = "  Group: " .. scene.people_group
+        end
+        if scene.people and #scene.people > 0 then
+            lines[#lines + 1] = "  People: " .. table.concat(scene.people, ", ")
+        end
+        if scene.categories and #scene.categories > 0 then
+            lines[#lines + 1] = "  Categories: " .. table.concat(scene.categories, ", ")
+        end
+        if scene.photo_numbers and #scene.photo_numbers > 0 then
+            local nums = {}
+            for _, n in ipairs(scene.photo_numbers) do nums[#nums + 1] = tostring(n) end
+            lines[#lines + 1] = "  Photos: " .. table.concat(nums, ", ")
+        end
+        if scene.redundancy_note then
+            lines[#lines + 1] = "  ⚠ Similar narrative role: " .. scene.redundancy_note
+        end
+        lines[#lines + 1] = ""
+    end
+
+    if inventory.redundancy_warnings and #inventory.redundancy_warnings > 0 then
+        lines[#lines + 1] = "NARRATIVE OVERLAP NOTES:"
+        for _, w in ipairs(inventory.redundancy_warnings) do
+            lines[#lines + 1] = "  - " .. w
+        end
+    end
+
+    return table.concat(lines, "\n")
 end
 
 -- == v3 Story assembly prompt builder ==========================================
@@ -2077,8 +2488,9 @@ end
 -- @param rollup           Table: from buildMetadataRollup
 -- @param allPhotosText    String: formatted text of all photo metadata
 -- @param targetCount      Number: number of beats to plan
+-- @param sceneInventory   String: formatted scene inventory (from formatSceneInventory), or nil
 -- @return string: the complete prompt
-function M.buildStoryAssemblyPrompt(userStoryPrompt, emphasis, eventTimeline, rollup, allPhotosText, targetCount)
+function M.buildStoryAssemblyPrompt(userStoryPrompt, emphasis, eventTimeline, rollup, allPhotosText, targetCount, sceneInventory)
     local prompt = M.STORY_ASSEMBLY_PROMPT_TEMPLATE
 
     local emphasisText = ""
@@ -2086,12 +2498,15 @@ function M.buildStoryAssemblyPrompt(userStoryPrompt, emphasis, eventTimeline, ro
         emphasisText = "## Emphasis\nThe photographer specifically asked to emphasize: " .. emphasis
     end
 
+    local sceneText = sceneInventory or "[Scene inventory not available — use photo descriptions to identify distinct moments.]"
+
     local rollupJson = json.encode(rollup)
 
     prompt = prompt:gsub("%%%%USER_STORY_PROMPT%%%%", function() return userStoryPrompt end)
     prompt = prompt:gsub("%%%%EMPHASIS%%%%", function() return emphasisText end)
     prompt = prompt:gsub("%%%%EVENT_TIMELINE%%%%", function() return eventTimeline end)
     prompt = prompt:gsub("%%%%METADATA_ROLLUP%%%%", function() return rollupJson end)
+    prompt = prompt:gsub("%%%%SCENE_INVENTORY%%%%", function() return sceneText end)
     prompt = prompt:gsub("%%%%ALL_PHOTOS%%%%", function() return allPhotosText end)
     prompt = prompt:gsub("%%%%TARGET_COUNT%%%%", function() return tostring(targetCount) end)
 
@@ -2103,37 +2518,9 @@ end
 -- @param raw  String: raw AI response
 -- @return (beatList, nil) or (nil, errorMsg)
 function M.parseBeatListResponse(raw)
-    if not raw or raw == "" then
-        return nil, "Empty response from model"
-    end
-
-    local ok, data
-
-    -- Level 1: Direct JSON parse
-    ok, data = pcall(json.decode, raw)
-
-    -- Level 2: Extract from markdown code block
-    if not (ok and type(data) == "table") then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-
-    -- Level 3: Find JSON object in surrounding text
-    if not (ok and type(data) == "table") then
-        local objStart = raw:find("{")
-        local objEnd = raw:reverse():find("}")
-        if objStart and objEnd then
-            objEnd = #raw - objEnd + 1
-            local objStr = raw:sub(objStart, objEnd)
-            ok, data = pcall(json.decode, objStr)
-        end
-    end
-
-    if not ok or type(data) ~= "table" then
-        return nil, "Could not parse beat list response as JSON: " .. raw:sub(1, 300)
+    local data, extractErr = M.extractJSON(raw)
+    if not data then
+        return nil, "Could not parse beat list response as JSON: " .. (extractErr or raw:sub(1, 300))
     end
 
     -- Extract beats array
@@ -2230,33 +2617,32 @@ end
 
 -- == v3 Parse candidate ranking response ======================================
 function M.parseCandidateRankingResponse(raw)
-    if not raw or raw == "" then
-        return nil, "Empty response"
+    local data, extractErr = M.extractJSON(raw)
+
+    if not data then
+        return nil, "Could not extract JSON from ranking response: " .. (extractErr or "unknown")
     end
 
-    local ok, data = pcall(json.decode, raw)
-    if not (ok and type(data) == "table") then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-    if not (ok and type(data) == "table") then
-        local objStr = raw:match("%{.-%}")
-        if objStr then
-            ok, data = pcall(json.decode, objStr)
-        end
+    -- Try multiple key names (LLM frequently paraphrases)
+    local rankedArr = data.ranked or data.ranking or data.rankings
+        or data.top_candidates or data.candidates or data.order
+        or data.top or data.results
+
+    -- Handle bare array response: data itself is [1, 5, 3, ...]
+    if not rankedArr and type(data) == "table" and type(data[1]) == "number" then
+        rankedArr = data
     end
 
-    if ok and data and data.ranked and type(data.ranked) == "table" then
+    if rankedArr and type(rankedArr) == "table" then
         -- Validate all entries are numbers
         local ranked = {}
-        for _, v in ipairs(data.ranked) do
+        for _, v in ipairs(rankedArr) do
             local n = tonumber(v)
             if n then ranked[#ranked + 1] = n end
         end
-        return ranked, nil
+        if #ranked > 0 then
+            return ranked, nil
+        end
     end
 
     return nil, "Could not parse candidate ranking: " .. (raw or ""):sub(1, 200)
@@ -2324,26 +2710,9 @@ end
 -- Parses the vision model's response to a beat casting call.
 -- @return table {primary, backup, reasoning, flag} or nil, error
 function M.parseBeatCastingResponse(raw)
-    if not raw or raw == "" then
-        return nil, "Empty response"
-    end
+    local data, extractErr = M.extractJSON(raw)
 
-    local ok, data = pcall(json.decode, raw)
-    if not (ok and type(data) == "table") then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-    if not (ok and type(data) == "table") then
-        local objStr = raw:match("%{[\1-\127\128-\255]-primary[\1-\127\128-\255]-%}")
-        if objStr then
-            ok, data = pcall(json.decode, objStr)
-        end
-    end
-
-    if ok and data and data.primary then
+    if data and data.primary then
         return {
             primary   = tonumber(data.primary),
             backup    = tonumber(data.backup),
@@ -2384,40 +2753,21 @@ end
 
 -- == v3 Parse story review response ===========================================
 function M.parseStoryReviewResponse(raw)
-    if not raw or raw == "" then
-        return nil, "Empty response"
+    local data, err = M.extractJSON(raw)
+    if not data then
+        return nil, "Could not parse story review: " .. (err or (raw or ""):sub(1, 200))
     end
 
-    local ok, data = pcall(json.decode, raw)
-    if not (ok and type(data) == "table") then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-    if not (ok and type(data) == "table") then
-        -- Try to find a JSON object containing story_coherence
-        local objStr = raw:match("%{[\1-\127\128-\255]-story_coherence[\1-\127\128-\255]-%}")
-        if objStr then
-            ok, data = pcall(json.decode, objStr)
-        end
-    end
-
-    if ok and data then
-        return {
-            photoAssessments   = data.photo_assessments or {},
-            duplicates         = data.duplicates or {},
-            gaps               = data.gaps or {},
-            pacingIssues       = data.pacing_issues or {},
-            storyCoherence     = tonumber(data.story_coherence) or 5,
-            coherenceNotes     = data.story_coherence_notes or "",
-            swapRecommendations = data.swap_recommendations or {},
-            batchSummary       = data.batch_summary or "",
-        }, nil
-    end
-
-    return nil, "Could not parse story review: " .. (raw or ""):sub(1, 200)
+    return {
+        photoAssessments   = data.photo_assessments or {},
+        duplicates         = data.duplicates or {},
+        gaps               = data.gaps or {},
+        pacingIssues       = data.pacing_issues or {},
+        storyCoherence     = tonumber(data.story_coherence) or 5,
+        coherenceNotes     = data.story_coherence_notes or "",
+        swapRecommendations = data.swap_recommendations or {},
+        batchSummary       = data.batch_summary or "",
+    }, nil
 end
 
 -- == v3 Build swap resolution prompt (Pass 6) =================================
@@ -2437,26 +2787,9 @@ end
 
 -- == v3 Parse swap resolution response ========================================
 function M.parseSwapResolutionResponse(raw)
-    if not raw or raw == "" then
-        return nil, "Empty response"
-    end
+    local data, extractErr = M.extractJSON(raw)
 
-    local ok, data = pcall(json.decode, raw)
-    if not (ok and type(data) == "table") then
-        local block = raw:match("```json%s*([\1-\127\128-\255]-)%s*```")
-                   or raw:match("```%s*([\1-\127\128-\255]-)%s*```")
-        if block then
-            ok, data = pcall(json.decode, block)
-        end
-    end
-    if not (ok and type(data) == "table") then
-        local objStr = raw:match("%{[\1-\127\128-\255]-action[\1-\127\128-\255]-%}")
-        if objStr then
-            ok, data = pcall(json.decode, objStr)
-        end
-    end
-
-    if ok and data and data.action then
+    if data and data.action then
         return {
             action      = data.action,       -- "keep" or "swap"
             replacement = tonumber(data.replacement),
@@ -2495,6 +2828,12 @@ local function parseBmpGrayscale(path)
         local b1, b2, b3, b4 = data:byte(offset, offset + 3)
         return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
     end
+    -- Signed 32-bit — needed for BMP height (negative = top-down)
+    local function s32(offset)
+        local val = u32(offset)
+        if val >= 2147483648 then val = val - 4294967296 end
+        return val
+    end
     local function u16(offset)
         local b1, b2 = data:byte(offset, offset + 1)
         return b1 + b2 * 256
@@ -2502,8 +2841,12 @@ local function parseBmpGrayscale(path)
 
     local pixelOffset = u32(11)
     local width       = u32(19)
-    local height      = u32(23)
+    local rawHeight   = s32(23)
     local bpp         = u16(29)
+
+    -- Negative height means top-down row order (common in modern macOS sips output)
+    local topDown = rawHeight < 0
+    local height  = math.abs(rawHeight)
 
     -- Support both 24-bit (RGB) and 32-bit (RGBA) BMPs
     local bytesPerPixel
@@ -2520,7 +2863,12 @@ local function parseBmpGrayscale(path)
     local rows = {}
     for y = 0, height - 1 do
         local row = {}
-        local rowStart = pixelOffset + (height - 1 - y) * rowBytes
+        local rowStart
+        if topDown then
+            rowStart = pixelOffset + y * rowBytes
+        else
+            rowStart = pixelOffset + (height - 1 - y) * rowBytes
+        end
         for x = 0, width - 1 do
             local pixStart = rowStart + x * bytesPerPixel + 1
             if pixStart + 2 > #data then return nil end

@@ -955,9 +955,6 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
         return nil, "No story prompt provided"
     end
 
-    -- ── Pass 2: Story Assembly (text-only) ───────────────────────────────
-    progress:setCaption("Pass 2: Planning story beats...")
-
     -- Build event timeline from snapshots
     local events = mergeSnapshots(snapshots)
     local eventTimeline
@@ -1029,16 +1026,71 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
     end
     local allPhotosText = table.concat(allPhotosLines, "\n")
 
+    -- ── Scene Inventory (pre-Pass 2) ──────────────────────────────────────
+    -- Cluster all photos into distinct visual scenes so the story assembly
+    -- pass can ensure variety and avoid thematic duplication.
+    progress:setCaption("Analyzing scenes...")
+    local sceneInventoryText = nil
+
+    if settings.provider ~= "ollama" then
+        Logger.info("Scene inventory: clustering photos into distinct moments...")
+        local scenePrompt = Engine.buildSceneInventoryPrompt(allPhotosText, rollup)
+        -- Scale token budget with photo count: base 4096 + 64 tokens per photo
+        local sceneMaxTokens = math.max(
+            BatchStrategy.getMaxTokens(settings.provider, "synthesis"),
+            4096 + #photoList * 64
+        )
+        local sceneResponse, sceneErr = Engine.queryText(scenePrompt, settings, sceneMaxTokens)
+
+        if sceneResponse then
+            local inventory, parseErr = Engine.parseSceneInventoryResponse(sceneResponse)
+            if inventory then
+                sceneInventoryText = Engine.formatSceneInventory(inventory)
+                Logger.info(string.format("Scene inventory: %d distinct scenes identified",
+                    inventory.total_scenes or #inventory.scenes))
+                for _, scene in ipairs(inventory.scenes) do
+                    Logger.info(string.format("  Scene %d: %s (%d photos)",
+                        scene.scene_id or 0, scene.name or "?",
+                        scene.count or #(scene.photo_numbers or {})))
+                end
+                if inventory.redundancy_warnings and #inventory.redundancy_warnings > 0 then
+                    for _, w in ipairs(inventory.redundancy_warnings) do
+                        Logger.warn("  Redundancy: " .. w)
+                    end
+                end
+            else
+                Logger.warn("Scene inventory: parse failed — " .. tostring(parseErr))
+            end
+        else
+            Logger.warn("Scene inventory: query failed — " .. tostring(sceneErr))
+        end
+        Logger.info("Scene inventory cost: " .. Engine.formatCostSummary())
+    else
+        Logger.info("Scene inventory: skipped for Ollama (text-only pass)")
+    end
+
+    -- ── Pass 2: Story Assembly (text-only) ───────────────────────────────
+    progress:setCaption("Pass 2: Planning story beats...")
+
     -- Build and send the story assembly prompt
     local assemblyPrompt = Engine.buildStoryAssemblyPrompt(
-        storyPrompt, storyEmphasis, eventTimeline, rollup, allPhotosText, targetCount
+        storyPrompt, storyEmphasis, eventTimeline, rollup, allPhotosText, targetCount,
+        sceneInventoryText
     )
 
     Logger.info(string.format("Pass 2: Story assembly prompt length: %d chars, %d photos",
         #assemblyPrompt, #photoList))
 
-    local maxTokens = BatchStrategy.getMaxTokens(settings.provider, "synthesis")
-    local assemblyResponse, assemblyErr = Engine.queryText(assemblyPrompt, settings, maxTokens)
+    -- Scale token budget: base synthesis limit + headroom for larger collections
+    local maxTokens = math.max(
+        BatchStrategy.getMaxTokens(settings.provider, "synthesis"),
+        4096 + #photoList * 32
+    )
+    local assemblyResponse, assemblyErr, assemblyStopReason = Engine.queryText(assemblyPrompt, settings, maxTokens)
+
+    if assemblyStopReason then
+        Logger.info("Pass 2: Stop reason: " .. tostring(assemblyStopReason))
+    end
 
     if not assemblyResponse then
         return nil, "Story assembly failed: " .. tostring(assemblyErr)
@@ -1047,6 +1099,12 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
     -- Parse beat list
     local beatResult, beatErr = Engine.parseBeatListResponse(assemblyResponse)
     if not beatResult then
+        -- Check if truncation caused the parse failure
+        local sr = assemblyStopReason and assemblyStopReason:lower() or ""
+        if sr == "max_tokens" or sr == "length" or sr == "max_output_tokens" then
+            return nil, "Story assembly TRUNCATED — model hit output token limit (" ..
+                tostring(maxTokens) .. " tokens). Try reducing photo count or switching providers."
+        end
         return nil, "Could not parse story assembly: " .. tostring(beatErr)
     end
 
@@ -1183,6 +1241,70 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
             beatIdx, #candidates, beat.beat))
     end
 
+    -- ── Pass 3A.5: Protect scarce candidates ────────────────────────────
+    -- Photos that are candidates for only 1 beat are "exclusive" to that beat.
+    -- Remove them from all other beats' candidate lists so they aren't stolen.
+    do
+        -- Count how many beats each photo appears in
+        local photoBeatCount = {}  -- id → count
+        local photoBeatMap   = {}  -- id → {beatIdx, ...}
+        for beatIdx, candidates in pairs(candidatesByBeat) do
+            for _, c in ipairs(candidates) do
+                photoBeatCount[c.id] = (photoBeatCount[c.id] or 0) + 1
+                if not photoBeatMap[c.id] then photoBeatMap[c.id] = {} end
+                photoBeatMap[c.id][#photoBeatMap[c.id] + 1] = beatIdx
+            end
+        end
+
+        -- Find photos that appear in exactly 1 beat — these are exclusive
+        local exclusivePhotos = {}  -- id → beatIdx they belong to
+        for id, count in pairs(photoBeatCount) do
+            if count == 1 then
+                exclusivePhotos[id] = photoBeatMap[id][1]
+            end
+        end
+
+        -- Now find photos that appear in many beats but are the ONLY candidate
+        -- for at least one beat — protect them for that beat
+        local protectedPhotos = {}  -- id → beatIdx to protect for
+        for beatIdx, candidates in pairs(candidatesByBeat) do
+            if #candidates <= 2 then
+                -- This beat has very few candidates — protect them
+                for _, c in ipairs(candidates) do
+                    if not protectedPhotos[c.id] then
+                        protectedPhotos[c.id] = beatIdx
+                    end
+                end
+            end
+        end
+
+        -- Remove protected photos from beats they don't belong to
+        local totalProtected = 0
+        for id, ownerBeat in pairs(protectedPhotos) do
+            if not exclusivePhotos[id] then  -- already exclusive, skip
+                for beatIdx, candidates in pairs(candidatesByBeat) do
+                    if beatIdx ~= ownerBeat then
+                        local filtered = {}
+                        for _, c in ipairs(candidates) do
+                            if c.id ~= id then
+                                filtered[#filtered + 1] = c
+                            end
+                        end
+                        if #filtered < #candidates then
+                            candidatesByBeat[beatIdx] = filtered
+                            totalProtected = totalProtected + 1
+                        end
+                    end
+                end
+            end
+        end
+
+        if totalProtected > 0 then
+            Logger.info(string.format("Pass 3A.5: Protected scarce candidates — %d removals across beats",
+                totalProtected))
+        end
+    end
+
     -- ── Pass 3B: AI text ranking (per beat) ──────────────────────────────
     -- Ranks candidates semantically. Does NOT make final selections — Pass 4 does.
     progress:setCaption("Pass 3B: AI ranking candidates per beat...")
@@ -1317,10 +1439,29 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
     local finalSelection = {}
     local beatResults = {}   -- {primary=id, backup=id, flag=...} per beat
 
+    -- Build scarcity-ordered beat processing list: fewest candidates first.
+    -- This ensures beats with scarce/unique photos (pelicans, grilling)
+    -- get first pick before beats with 30+ candidates drain the pool.
+    local beatOrder = {}
+    for beatIdx = 1, #beats do
+        local count = candidatesByBeat[beatIdx] and #candidatesByBeat[beatIdx] or 0
+        beatOrder[#beatOrder + 1] = { beatIdx = beatIdx, candidateCount = count }
+    end
+    table.sort(beatOrder, function(a, b) return a.candidateCount < b.candidateCount end)
+
+    -- Log the processing order
+    local orderStr = {}
+    for _, bo in ipairs(beatOrder) do
+        orderStr[#orderStr + 1] = string.format("%d(%d)", bo.beatIdx, bo.candidateCount)
+    end
+    Logger.info("Pass 4: Beat processing order (scarcity-first): " .. table.concat(orderStr, ", "))
+
     if settings.provider == "ollama" then
         -- Ollama: skip vision casting, use text-ranked/composite order
         Logger.info("Pass 4: Ollama — using text-ranked selections (no vision)")
-        for beatIdx, beat in ipairs(beats) do
+        for _, bo in ipairs(beatOrder) do
+            local beatIdx = bo.beatIdx
+            local beat = beats[beatIdx]
             local candidates = candidatesByBeat[beatIdx]
             if candidates and #candidates > 0 then
                 for _, c in ipairs(candidates) do
@@ -1341,22 +1482,28 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
             end
         end
     else
-        -- Cloud providers: vision-based beat casting in sequential waves
+        -- Cloud providers: vision-based beat casting in scarcity-first order
         -- Waves of 3 beats: each wave sees previous selections as context
         local WAVE_SIZE = 3
         local previousSelections = {}  -- {position, content} for redundancy context
 
-        local totalWaves = math.ceil(#beats / WAVE_SIZE)
+        local totalWaves = math.ceil(#beatOrder / WAVE_SIZE)
         for waveIdx = 1, totalWaves do
             local waveStart = (waveIdx - 1) * WAVE_SIZE + 1
-            local waveEnd   = math.min(waveIdx * WAVE_SIZE, #beats)
+            local waveEnd   = math.min(waveIdx * WAVE_SIZE, #beatOrder)
 
-            Logger.info(string.format("Pass 4: Wave %d/%d — beats %d-%d",
-                waveIdx, totalWaves, waveStart, waveEnd))
+            -- Log which beats are in this wave
+            local waveBeatNums = {}
+            for i = waveStart, waveEnd do
+                waveBeatNums[#waveBeatNums + 1] = tostring(beatOrder[i].beatIdx)
+            end
+            Logger.info(string.format("Pass 4: Wave %d/%d — beats %s",
+                waveIdx, totalWaves, table.concat(waveBeatNums, ",")))
             progress:setCaption(string.format("Pass 4: Beat casting (wave %d/%d)...",
                 waveIdx, totalWaves))
 
-            for beatIdx = waveStart, waveEnd do
+            for orderPos = waveStart, waveEnd do
+                local beatIdx = beatOrder[orderPos].beatIdx
                 local beat = beats[beatIdx]
                 local candidates = candidatesByBeat[beatIdx]
 
@@ -1513,6 +1660,106 @@ local function selectStoryV3(pool, settings, catalog, snapshots, photoStore, pro
         end  -- waves
     end  -- cloud vs ollama
     Logger.info("Pass 4 cost: " .. Engine.formatCostSummary())
+
+    -- ── Pass 4.5: Similarity Gate (phash-based) ─────────────────────────
+    -- Check pairwise phash distance between selected photos. If two are
+    -- visually similar AND captured close together, swap the weaker one
+    -- for its backup candidate.
+    local SIMILARITY_THRESHOLD = 16  -- out of 64 bits (~75% similar)
+    local SIMILARITY_TIME_SECS = 300 -- 5 minutes
+    local similaritySwaps = 0
+
+    -- Sort by position for pairwise comparison
+    table.sort(finalSelection, function(a, b)
+        return (a.storyPosition or 0) < (b.storyPosition or 0)
+    end)
+
+    Logger.info("Pass 4.5: Similarity gate — checking " .. #finalSelection .. " selected photos")
+
+    -- Compare every pair (not just adjacent — the story may reorder)
+    local swapped = {}  -- track indices we've already swapped to avoid cascading
+    for i = 1, #finalSelection do
+        if not swapped[i] then
+            for j = i + 1, #finalSelection do
+                if not swapped[j] then
+                    local a = finalSelection[i]
+                    local b = finalSelection[j]
+
+                    -- Both need phash values
+                    if a.phash and b.phash then
+                        local dist = Engine.hashDistance(a.phash, b.phash)
+                        if dist < SIMILARITY_THRESHOLD then
+                            -- Phash is similar — check time proximity
+                            local timeA = a.timestamp or 0
+                            local timeB = b.timestamp or 0
+                            local timeDiff = math.abs(timeA - timeB)
+
+                            if timeDiff <= SIMILARITY_TIME_SECS then
+                                -- Similar AND close in time — swap the lower-scoring one
+                                Logger.warn(string.format(
+                                    "  Similarity: beats %d & %d — phash distance %d, %ds apart",
+                                    a.storyPosition or 0, b.storyPosition or 0, dist, timeDiff))
+
+                                -- Determine which to swap (lower composite score)
+                                local swapIdx = (a.compositeScore <= b.compositeScore) and i or j
+                                local swapEntry = finalSelection[swapIdx]
+                                local swapId = tostring(swapEntry.photo.localIdentifier)
+
+                                -- Find the beat index for this entry
+                                local swapBeatIdx = nil
+                                for bIdx, br in pairs(beatResults) do
+                                    if br.primaryId == swapId then
+                                        swapBeatIdx = bIdx
+                                        break
+                                    end
+                                end
+
+                                -- Try to use backup candidate
+                                local replaced = false
+                                if swapBeatIdx and beatResults[swapBeatIdx]
+                                   and beatResults[swapBeatIdx].backupId
+                                   and not usedIds[beatResults[swapBeatIdx].backupId] then
+                                    local backupId = beatResults[swapBeatIdx].backupId
+                                    -- Find backup entry in the candidate pool
+                                    for _, e in ipairs(pool) do
+                                        local eid = tostring(e.photo.localIdentifier)
+                                        if eid == backupId then
+                                            -- Swap it in
+                                            usedIds[swapId] = nil
+                                            usedIds[backupId] = true
+                                            local beat = beats[swapBeatIdx]
+                                            e.storyBeat     = beat.beat
+                                            e.storyRole     = beat.narrativeRole
+                                            e.storyNote     = beat.description
+                                            e.storyPosition = beat.position
+                                            finalSelection[swapIdx] = e
+                                            beatResults[swapBeatIdx].primaryId = backupId
+                                            replaced = true
+                                            similaritySwaps = similaritySwaps + 1
+                                            Logger.info(string.format(
+                                                "  Swapped beat %d: %s → backup %s (phash distance %d)",
+                                                beat.position, swapId, backupId, dist))
+                                            break
+                                        end
+                                    end
+                                end
+
+                                if not replaced then
+                                    Logger.warn(string.format(
+                                        "  No backup available for beat %d — keeping similar pair",
+                                        swapEntry.storyPosition or 0))
+                                end
+
+                                swapped[swapIdx] = true
+                            end  -- timeDiff check
+                        end  -- dist check
+                    end  -- phash check
+                end  -- not swapped[j]
+            end  -- j loop
+        end  -- not swapped[i]
+    end  -- i loop
+
+    Logger.info(string.format("Pass 4.5: %d similarity swaps applied", similaritySwaps))
 
     -- ── Pass 5: Story Review (vision) ─────────────────────────────────────
     -- Send final selection as images in story order for review.
@@ -1937,6 +2184,7 @@ local function runSelection(context, overrides, snapshots)
             reject       = e.reject,
             captureTime  = captureTime,
             exif         = #exifParts > 0 and table.concat(exifParts, ", ") or nil,
+            phash        = e.phash,
             people       = {},   -- populated by face query later
             batchIndex   = nil,  -- populated during story mode if snapshots available
             cachedImagePath = nil,  -- populated when image cache is built (Passes 4-6)
@@ -1957,7 +2205,13 @@ local function runSelection(context, overrides, snapshots)
         Logger.info("Face query unavailable — photoStore.people will be empty")
     end
 
-    Logger.info("photoStore built: " .. tostring(totalScored) .. " entries")
+    -- Log phash stats
+    local phashCount = 0
+    for _, store in pairs(photoStore) do
+        if store.phash then phashCount = phashCount + 1 end
+    end
+    Logger.info(string.format("photoStore built: %d entries (%d with phash)",
+        totalScored, phashCount))
 
     progress:setPortionComplete(1, 10)
 
@@ -2124,12 +2378,21 @@ local function runSelection(context, overrides, snapshots)
     end
 
     local newCollection
-    catalog:withWriteAccessDo("AI Selects - Create Collection", function()
-        newCollection = catalog:createCollection(collectionName, nil, true)
-        if newCollection then
-            newCollection:addPhotos(selectedPhotos)
-        end
-    end, { timeout = 10 })
+    local writeOk, writeErr
+    local ok, err = LrTasks.pcall(function()
+        catalog:withWriteAccessDo("AI Selects - Create Collection", function()
+            newCollection = catalog:createCollection(collectionName, nil, true)
+            if newCollection then
+                newCollection:addPhotos(selectedPhotos)
+            end
+        end, { timeout = 10 })
+    end)
+    if ok and newCollection then
+        writeOk = true
+    else
+        writeOk = false
+        writeErr = err or "Collection creation returned nil"
+    end
 
     -- Navigate to the new collection
     if newCollection then

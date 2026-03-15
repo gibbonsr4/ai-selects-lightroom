@@ -41,7 +41,7 @@ local PROVIDER_CONFIG = {
         maxAnchors       = 2,
         supportsSnapshot = true,
         scoringMaxTokens = 4096,
-        synthesisMaxTokens = 8192,
+        synthesisMaxTokens = 16384,  -- Extra headroom: Gemini 2.5 thinking may leak tokens despite thinkingBudget=0
         defaultTimeout   = 180,
     },
 }

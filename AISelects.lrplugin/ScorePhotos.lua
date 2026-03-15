@@ -475,13 +475,17 @@ local function runScoring(context, config)
         -- 4. Send batch API call
         local queryStart = LrDate.currentTime()
         local maxTokens = BatchStrategy.getMaxTokens(provider, "scoring")
-        local rawResponse, queryErr = Engine.queryBatch(
+        local rawResponse, queryErr, stopReason = Engine.queryBatch(
             images, imageLabels, anchorImages, anchorLabels,
             prompt, SETTINGS, maxTokens
         )
         local queryElapsed = LrDate.currentTime() - queryStart
 
         log:log(string.format("  Query time: %.1fs", queryElapsed))
+
+        if stopReason then
+            log:log("  Stop reason: " .. tostring(stopReason))
+        end
 
         if not rawResponse then
             log:logBatch(batchIdx, totalBatches, #batch, "API error: " .. (queryErr or "unknown"))
@@ -499,17 +503,22 @@ local function runScoring(context, config)
         end
 
         -- 5. Parse batch response (positional — no ID matching needed)
-        local batchScores, snapshot, parseErr = Engine.parseBatchResponse(rawResponse)
+        local batchScores, snapshot, parseMsg = Engine.parseBatchResponse(rawResponse, stopReason)
 
         if not batchScores then
-            log:logBatch(batchIdx, totalBatches, #batch, "Parse error: " .. (parseErr or "unknown"))
+            log:logBatch(batchIdx, totalBatches, #batch, "Parse error: " .. (parseMsg or "unknown"))
             for pos = 1, #images do
                 local info = photoByPosition[pos]
                 if info then
-                    errorLog[#errorLog + 1] = "- " .. info.filename .. "\n  Parse error: " .. (parseErr or "unknown")
+                    errorLog[#errorLog + 1] = "- " .. info.filename .. "\n  " .. (parseMsg or "Parse error")
                 end
             end
             break  -- skip to next batch
+        end
+
+        -- Log warnings (e.g., partial recovery from truncation)
+        if parseMsg then
+            log:log("  ⚠ " .. parseMsg)
         end
 
         -- Validate score count matches photo count
@@ -564,6 +573,7 @@ local function runScoring(context, config)
             local hashVal, hashErr = Engine.computePhash(photo, phashTs)
             if hashVal then
                 phash = hashVal
+                log:log("  Phash for " .. filename .. ": " .. hashVal)
             else
                 log:log("  Phash skipped for " .. filename .. ": " .. tostring(hashErr))
             end
